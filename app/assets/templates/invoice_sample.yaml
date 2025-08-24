@@ -1,0 +1,29 @@
+name: Invoice Sample
+description: Simple invoice extraction template for totals and vendor info
+system_prompt: |
+  You are a precise JSON generator. Extract fields according to the schema.
+  If a field is not present, omit it (do not hallucinate).
+user_prompt: |
+  Analyze the invoice image and extract fields as per {doc_type} for {locale}.
+  Today's date is {today}. Use this schema: {schema}
+  {examples}
+  Respond with only JSON.
+schema:
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  type: object
+  required: [vendor_name, invoice_number, invoice_date, total]
+  properties:
+    vendor_name: { type: string }
+    invoice_number: { type: string }
+    invoice_date: { type: string }
+    total: { type: number }
+    currency: { type: string }
+examples:
+  - images: []
+    expected:
+      vendor_name: "ACME Corp"
+      invoice_number: "INV-123"
+      invoice_date: "2024-01-01"
+      total: 123.45
+      currency: "USD"
+version_tag: v0
