@@ -152,21 +152,21 @@ def _capability_probe(base_url: str, api_key: str, model_id: str, headers: Dict[
         
         # Create tiny PNG file for testing
         b64_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAukB9jQ9a6EAAAAASUVORK5CYII="
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
             tmp.write(base64.b64decode(b64_data))
             tmp.flush()
             tiny_png_path = tmp.name
-        
-        # Try EncA first (this will use image_url format internally)
-        result = gateway.chat_vision(
-            model=model_id,
-            system_text="",
-            user_text="Describe this image briefly.",
-            image_paths=[tiny_png_path],
-            fewshot_messages=None,
-            schema=None,
-            gen_params={"temperature": 1.0, "max_tokens": 10}
-        )
+            
+            # Try EncA first (this will use image_url format internally)
+            result = gateway.chat_vision(
+                model=model_id,
+                system_text="",
+                user_text="Describe this image briefly.",
+                image_paths=[tiny_png_path],
+                fewshot_messages=None,
+                schema=None,
+                gen_params={"temperature": 1.0, "max_tokens": 10}
+            )
         
         # Check if EncA worked or if it fell back to EncB
         if result.get("error"):
@@ -185,12 +185,6 @@ def _capability_probe(base_url: str, api_key: str, model_id: str, headers: Dict[
                 results["vision_encoding"] = "EncB"  # Fell back to EncB
             else:
                 results["vision_encoding"] = "EncA"  # EncA worked
-                
-        # Clean up temp file
-        try:
-            Path(tiny_png_path).unlink()
-        except Exception:
-            pass
             
     except Exception as e:
         results["vision"] = False
@@ -559,8 +553,33 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
             if base_url and not base_url.startswith(("http://", "https://")):
                 st.error("Base URL must start with http:// or https://")
             
-            # Fixed timeout of 120 seconds
-            timeout_s = 120
+            # Configurable timeout with smart defaults
+            url_lower = base_url.lower() if base_url else ""
+            is_local = any(indicator in url_lower for indicator in [
+                "localhost", "127.0.0.1", "0.0.0.0", "192.168.",
+                "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+                "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+                "172.28.", "172.29.", "172.30.", "172.31.",  # Private IP range B
+                "host.docker.internal", ".local", ".lan", ":1234", ":5000", ":5001",
+                ":8000", ":8080", ":8888", ":9000", ":11434", ":7860", ":7861"
+            ])
+            
+            # Special check for 10.x.x.x range
+            if not is_local and "10." in url_lower:
+                import re
+                if re.search(r'(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
+                    is_local = True
+            
+            default_timeout = 300 if is_local else 120  # 5 min for local, 2 min for cloud
+            
+            timeout_s = st.number_input(
+                "⏱️ Request Timeout (seconds)",
+                min_value=30,
+                max_value=600,
+                value=int(selected.timeout_s if (selected and selected.timeout_s) else default_timeout),
+                step=30,
+                help=f"How long to wait for model response. {'Local models may need more time (300s recommended).' if is_local else 'Cloud APIs typically respond within 120s.'}"
+            )
             
             max_output_tokens = st.number_input(
                 "Max Output Tokens 📝", 

@@ -39,6 +39,8 @@ class Provider(Base):
     default_max_output_tokens: Mapped[int | None] = mapped_column(nullable=True)
     default_force_json_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     default_prefer_tools: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Cached successful parameter names
+    cached_max_tokens_param: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Active flag
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
@@ -106,9 +108,10 @@ def init_db() -> None:
     _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False)
     try:
         _run_migrations()
-    except Exception:
-        # Best-effort migrations; continue even if no-op fails
-        pass
+    except Exception as e:
+        # Best-effort migrations; log but continue
+        import sys
+        print(f"Warning: Database migration failed: {e}", file=sys.stderr)
 
 
 def _run_migrations() -> None:
@@ -117,6 +120,9 @@ def _run_migrations() -> None:
         return
     with _engine.begin() as conn:
         def table_cols(name: str) -> set[str]:
+            # Use parameterized query to avoid SQL injection
+            if name not in ("providers", "templates", "runs", "tests"):
+                raise ValueError(f"Invalid table name: {name}")
             rows = conn.exec_driver_sql(f"PRAGMA table_info({name})").fetchall()
             return {r[1] for r in rows}  # type: ignore
 
@@ -136,10 +142,12 @@ def _run_migrations() -> None:
             "default_max_output_tokens": "INTEGER",
             "default_force_json_mode": "BOOLEAN",
             "default_prefer_tools": "BOOLEAN",
+            "cached_max_tokens_param": "TEXT",
             "is_active": "BOOLEAN",
         }
         for col, typ in add_map.items():
             if col not in cols:
+                # Column names and types are from hardcoded dict, safe from injection
                 conn.exec_driver_sql(f"ALTER TABLE providers ADD COLUMN {col} {typ}")
 
         # Templates table new columns
@@ -153,6 +161,7 @@ def _run_migrations() -> None:
         }
         for col, typ in add_map_t.items():
             if col not in cols_t:
+                # Column names and types are from hardcoded dict, safe from injection
                 conn.exec_driver_sql(f"ALTER TABLE templates ADD COLUMN {col} {typ}")
 
 

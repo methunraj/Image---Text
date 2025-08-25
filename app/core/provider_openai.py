@@ -1,16 +1,36 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
 
-def encode_image_to_data_url(path: str) -> str:
-    """Encode a local image file into a data URL (PNG/JPG supported)."""
+@lru_cache(maxsize=32)
+def _get_file_hash(path: str) -> str:
+    """Get a hash of file path and modification time for cache invalidation."""
+    try:
+        stat = os.stat(path)
+        # Use a separator that won't appear in file paths
+        return f"{path}|||{stat.st_mtime}|||{stat.st_size}"
+    except:
+        # Still use separator even on error for consistency
+        return f"{path}|||0|||0"
+
+@lru_cache(maxsize=32)
+def encode_image_to_data_url_cached(cache_key: str) -> str:
+    """Cached version of encode_image_to_data_url."""
+    # Extract actual path from cache key (split on ||| separator)
+    path = cache_key.split('|||')[0]
+    return _encode_image_to_data_url_uncached(path)
+
+def _encode_image_to_data_url_uncached(path: str) -> str:
+    """Internal uncached image encoding."""
     mime = "image/png"
     lower = path.lower()
     if lower.endswith(".jpg") or lower.endswith(".jpeg"):
@@ -33,8 +53,12 @@ def encode_image_to_data_url(path: str) -> str:
         return tiny_png_data_url()
     except Exception as e:
         print(f"Error encoding image {path}: {e}")
-        # As a last resort, return a 1x1 PNG
         return tiny_png_data_url()
+
+def encode_image_to_data_url(path: str) -> str:
+    """Encode a local image file into a data URL with caching."""
+    cache_key = _get_file_hash(path)
+    return encode_image_to_data_url_cached(cache_key)
 
 
 def tiny_png_data_url() -> str:
@@ -43,11 +67,15 @@ def tiny_png_data_url() -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def encode_image_to_b64(path: str) -> Tuple[str, str]:
-    """Return (base64_str, mime) for a local image path.
+@lru_cache(maxsize=32)
+def encode_image_to_b64_cached(cache_key: str) -> Tuple[str, str]:
+    """Cached version of encode_image_to_b64."""
+    # Extract actual path from cache key (split on ||| separator)
+    path = cache_key.split('|||')[0]
+    return _encode_image_to_b64_uncached(path)
 
-    Falls back to 1x1 PNG if reading fails.
-    """
+def _encode_image_to_b64_uncached(path: str) -> Tuple[str, str]:
+    """Internal uncached b64 encoding."""
     mime = "image/png"
     lower = path.lower()
     if lower.endswith(".jpg") or lower.endswith(".jpeg"):
@@ -62,6 +90,11 @@ def encode_image_to_b64(path: str) -> Tuple[str, str]:
         # transparent 1x1 png
         tiny_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAukB9jQ9a6EAAAAASUVORK5CYII="
         return tiny_b64, "image/png"
+
+def encode_image_to_b64(path: str) -> Tuple[str, str]:
+    """Return (base64_str, mime) for a local image path with caching."""
+    cache_key = _get_file_hash(path)
+    return encode_image_to_b64_cached(cache_key)
 
 
 def tiny_png_b64() -> str:
@@ -93,7 +126,7 @@ class OpenAIProvider:
         if extra:
             payload.update(extra)
 
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=3600.0) as client:
             resp = client.post(url, headers=self._headers(), json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -125,6 +158,42 @@ class OAIGateway:
     prefer_json_mode: bool
     prefer_tools: bool
     detected_caps: Optional[Dict[str, Any]] = None
+    cached_max_tokens_param: Optional[str] = None
+    provider_id: Optional[int] = None
+    
+    def _is_local_model(self) -> bool:
+        """Check if this is a local model endpoint."""
+        if not self.base_url:
+            return False
+        
+        url_lower = self.base_url.lower()
+        
+        # Check for local indicators - be more precise with IP ranges
+        local_indicators = [
+            "localhost", "127.0.0.1", "0.0.0.0",
+            "192.168.",  # Private range C
+            "172.16.", "172.17.", "172.18.", "172.19.",
+            "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", 
+            "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", 
+            "172.30.", "172.31.",  # Private range B (172.16.0.0 - 172.31.255.255)
+            "host.docker.internal",  # Docker
+            ".local",  # mDNS
+            ".lan",  # Local network
+            ":1234", ":5000", ":5001", ":8000", ":8080", ":8888", ":9000",  # Common local ports
+            ":11434",  # Ollama default
+            ":7860", ":7861",  # Gradio defaults
+            "lm-studio", "lmstudio", "ollama", "localai", "kobold"  # Known local servers
+        ]
+        
+        # Special handling for 10.x.x.x range (must be more precise)
+        if "10." in url_lower:
+            # Check if it's really 10.x.x.x and not 100.x or 210.x etc
+            import re
+            # Match IP addresses starting with 10.
+            if re.search(r'(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
+                return True
+        
+        return any(indicator in url_lower for indicator in local_indicators)
 
     def _headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {"Content-Type": "application/json"}
@@ -138,60 +207,96 @@ class OAIGateway:
             h.setdefault("HTTP-Referer", (self.headers or {}).get("HTTP-Referer", "http://localhost"))
             h.setdefault("X-Title", (self.headers or {}).get("X-Title", "Images-JSON App"))
         return h
+    
+    def _mask_sensitive_data(self, data: Any) -> Any:
+        """Mask sensitive information in debug output."""
+        if isinstance(data, dict):
+            masked = {}
+            for key, value in data.items():
+                if key.lower() in ('authorization', 'api_key', 'api-key', 'x-api-key', 'apikey'):
+                    if isinstance(value, str) and len(value) > 8:
+                        masked[key] = value[:4] + '***' + value[-4:]
+                    else:
+                        masked[key] = '***'
+                elif isinstance(value, (dict, list)):
+                    masked[key] = self._mask_sensitive_data(value)
+                else:
+                    masked[key] = value
+            return masked
+        elif isinstance(data, list):
+            return [self._mask_sensitive_data(item) for item in data]
+        return data
 
     def _client(self) -> httpx.Client:
-        t = httpx.Timeout(self.timeout, connect=self.timeout, read=self.timeout, write=self.timeout)
+        # Use 1 hour timeout to prevent premature timeouts with slow models
+        t = httpx.Timeout(3600, connect=3600, read=3600, write=3600)
         return httpx.Client(timeout=t)
 
     def _post_with_retries(self, url: str, json_payload: Dict[str, Any], max_retries: int = 3) -> httpx.Response:
-        # Debug the outgoing request
-        print(f"Debug [_post_with_retries]: Making request to {url}")
-        print(f"Debug [_post_with_retries]: Headers: {self._headers()}")
-        print(f"Debug [_post_with_retries]: Request payload keys: {list(json_payload.keys())}")
-        print(f"Debug [_post_with_retries]: Model: {json_payload.get('model', 'N/A')}")
-        print(f"Debug [_post_with_retries]: Messages count: {len(json_payload.get('messages', []))}")
-        if json_payload.get('messages'):
-            print(f"Debug [_post_with_retries]: First message role: {json_payload['messages'][0].get('role', 'N/A')}")
+        # Only show verbose debug on first attempt or if VERBOSE_DEBUG is set
+        verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
         
-        # Show payload structure (truncated for readability)
-        import json
-        payload_str = json.dumps(json_payload, indent=2, default=str)
-        if len(payload_str) > 1000:
-            print(f"Debug [_post_with_retries]: Request payload (truncated):")
-            print(payload_str[:1000] + "...")
-        else:
-            print(f"Debug [_post_with_retries]: Request payload:")
-            print(payload_str)
+        if verbose:
+            print(f"Debug [API Request]: Making request to {url}")
+            print(f"Debug [API Request]: Model: {json_payload.get('model', 'N/A')}")
+            print(f"Debug [API Request]: Messages count: {len(json_payload.get('messages', []))}")
+            
+            # Show payload structure with sensitive data masked
+            import json
+            masked_headers = self._mask_sensitive_data(self._headers())
+            print(f"Debug [API Request]: Headers (masked): {masked_headers}")
+            
+            # Don't show full payload to avoid leaking prompts with potential sensitive data
+            payload_keys = list(json_payload.keys())
+            print(f"Debug [API Request]: Payload keys: {payload_keys}")
         
         delay = 0.5
         last_exc: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
-            print(f"Debug [_post_with_retries]: Attempt {attempt}/{max_retries}")
+            # Only show attempt info if it's a retry (attempt > 1) or there's an error
             try:
                 with self._client() as client:
                     resp = client.post(url, headers=self._headers(), json=json_payload)
-                    print(f"Debug [_post_with_retries]: Response status: {resp.status_code}")
-                    print(f"Debug [_post_with_retries]: Response headers: {dict(resp.headers)}")
                     
-                    # Retry on 5xx and 429
+                    # Check for retryable errors
                     if resp.status_code in (429, 500, 502, 503, 504):
                         error_body = resp.text if hasattr(resp, 'text') else 'No body'
-                        print(f"Debug [_post_with_retries]: Retryable error {resp.status_code}, body: {error_body[:200]}")
+                        print(f"⚠️ Retryable error {resp.status_code} on attempt {attempt}/{max_retries}")
+                        if verbose:
+                            print(f"   Error body: {error_body[:200]}")
                         last_exc = httpx.HTTPStatusError("server error", request=resp.request, response=resp)
                         raise last_exc
+                    
                     resp.raise_for_status()
-                    print(f"Debug [_post_with_retries]: Request successful on attempt {attempt}")
+                    
+                    # Success - only show if it was a retry
+                    if attempt > 1:
+                        print(f"✅ Request successful after {attempt} attempts")
+                    elif verbose:
+                        print(f"Debug [API Request]: Response status: {resp.status_code}")
+                    
                     return resp
+                    
             except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
-                print(f"Debug [_post_with_retries]: Exception on attempt {attempt}: {type(e).__name__}: {e}")
+                # Always show errors
+                if isinstance(e, httpx.TimeoutException):
+                    print(f"⏱️ Timeout on attempt {attempt}/{max_retries}")
+                elif not (hasattr(e, 'response') and e.response.status_code in (429, 500, 502, 503, 504)):
+                    # Non-retryable HTTP error
+                    print(f"❌ HTTP Error on attempt {attempt}: {e}")
+                    if verbose and hasattr(e, 'response'):
+                        print(f"   Response: {e.response.text[:200] if hasattr(e.response, 'text') else 'No body'}")
+                
                 last_exc = e
                 if attempt >= max_retries:
                     break
-                print(f"Debug [_post_with_retries]: Retrying in {delay}s...")
+                    
+                print(f"   Retrying in {delay}s...")
                 time.sleep(delay)
                 delay = min(delay * 2, 4.0)
+        
         assert last_exc is not None
-        print(f"Debug [_post_with_retries]: All attempts failed, raising: {last_exc}")
+        print(f"❌ All {max_retries} attempts failed")
         raise last_exc
 
     @staticmethod
@@ -468,10 +573,19 @@ class OAIGateway:
 
         # Build user message later per encoding variant
 
-        # Decide modes
+        # Decide modes - be more conservative with local models
         caps = self.detected_caps or {}
-        tools_ok = True if (self.detected_caps is None) else bool(caps.get("tools"))
-        json_ok = True if (self.detected_caps is None) else bool(caps.get("json_mode"))
+        is_local = self._is_local_model()
+        
+        # Local models often don't support tools or JSON mode properly
+        if is_local and self.detected_caps is None:
+            # For unprobed local models, assume no advanced features
+            tools_ok = False
+            json_ok = False
+        else:
+            tools_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("tools"))
+            json_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("json_mode"))
+        
         use_tools = bool(self.prefer_tools and tools_ok and schema)
         use_json_mode = bool((not use_tools) and self.prefer_json_mode and json_ok)
 
@@ -487,52 +601,216 @@ class OAIGateway:
 
         # Helper: select a compatible max-tokens key and send
         def _keys_order() -> List[str]:
-            local = bool(self.base_url and ("localhost" in self.base_url or "127.0.0.1" in self.base_url))
+            # Check if this is a local model (more comprehensive detection)
+            local = self._is_local_model()
+            
             if local:
-                # Extended list for better local model compatibility
-                return ["n_predict", "max_tokens", "max_new_tokens", "max_length", "max_gen_tokens", "num_predict", "max_tokens_to_sample"]
-            # Default order covers common variants across providers
-            return ["max_tokens", "max_output_tokens", "max_completion_tokens", "max_tokens_to_sample", "n_predict"]
+                # Comprehensive list for ALL local model servers (deduplicated)
+                # Using list to preserve order, but convert to dict first to remove duplicates
+                params = []
+                seen = set()
+                
+                candidates = [
+                    # Most common first
+                    "n_predict",  # LM Studio, llama.cpp
+                    "max_tokens",  # OpenAI compatible
+                    "max_new_tokens",  # Text Generation WebUI, TGI
+                    "max_length",  # Multiple servers
+                    # Ollama specific
+                    "num_predict", "num_ctx",
+                    # Other variants
+                    "truncation_length",  # Oobabooga
+                    "max_tokens_to_sample",  # LocalAI, Anthropic style
+                    "max_gen_tokens",  # LocalAI
+                    "prediction_length",  # Alternative llama.cpp
+                    "max_completion_tokens",  # vLLM
+                    "max_context_length",  # KoboldAI
+                    "max_gen_len", "max_seq_len",  # Alpaca
+                    # Generic fallbacks
+                    "maximum_tokens", "response_length", "output_length",
+                    "completion_tokens", "generate_length"
+                ]
+                
+                for param in candidates:
+                    if param not in seen:
+                        params.append(param)
+                        seen.add(param)
+                
+                return params
+            
+            # Cloud providers - ordered by likelihood
+            return [
+                # OpenAI / OpenAI-compatible
+                "max_tokens", "max_completion_tokens",
+                # Anthropic Claude
+                "max_tokens_to_sample", "max_tokens",
+                # Google (Gemini, PaLM)
+                "maxOutputTokens", "max_output_tokens", "candidateCount",
+                # Cohere
+                "max_tokens", "max_output_tokens",
+                # Azure OpenAI
+                "max_tokens", "maxTokens",
+                # AWS Bedrock
+                "maxTokenCount", "max_tokens_to_sample", "max_gen_len",
+                # Replicate
+                "max_tokens", "max_new_tokens", "max_length",
+                # Together AI
+                "max_tokens", "max_new_tokens",
+                # Perplexity
+                "max_tokens", "max_completion_tokens",
+                # DeepSeek
+                "max_tokens", "max_new_tokens",
+                # Mistral
+                "max_tokens", "maxTokens",
+                # Generic fallbacks
+                "n_predict", "response_max_tokens"
+            ]
+
 
         def _send_with_max_variants(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+            # Get verbose flag for debug output
+            verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+            
+            # Use persisted cached parameter if available
+            cached_param = self.cached_max_tokens_param
+            
             tried: List[str] = []
             last_exc: Optional[httpx.HTTPStatusError] = None
-            # Build ordered candidates; always include a "no max tokens param" attempt last
-            if max_tokens_val is not None:
-                order = _keys_order() + [None]  # type: ignore[operator]
+            failed_with_none = False
+            
+            # Build ordered candidates
+            if cached_param and max_tokens_val is not None:
+                # Use cached successful parameter first, then try None if it fails
+                order = [cached_param, None]  # type: ignore[list-item]
+                print(f"🔄 Using cached max_tokens parameter: '{cached_param}'")
+            elif max_tokens_val is not None:
+                # Get comprehensive parameter list and add None as final fallback
+                keys = _keys_order()
+                # Limit attempts: 8 for local (they have more variants), 5 for cloud
+                is_local = self._is_local_model()
+                limit = 8 if is_local else 5
+                order = keys[:limit] + [None]  # Add None as final fallback
+                if not cached_param:
+                    print(f"🔍 Testing max_tokens parameter compatibility for {'LOCAL MODEL' if is_local else 'API endpoint'}...")
             else:
                 order = [None]  # type: ignore[list-item]
-            for key in order:
+            
+            # Prevent infinite loops - max attempts = actual list length
+            max_attempts = len(order)
+            attempts = 0
+            
+            for i, key in enumerate(order):
+                if attempts >= max_attempts:
+                    print(f"⚠️ Reached maximum attempts ({max_attempts}), stopping parameter testing")
+                    break
+                attempts += 1
+                
                 # Build payload with only one max token key (or none)
                 payload: Dict[str, Any] = {"model": model, "messages": messages, **base_payload}
                 if key:  # type: ignore[truthy-bool]
                     payload[key] = max_tokens_val
                     tried.append(key)
-                    is_local = bool(self.base_url and ("localhost" in self.base_url or "127.0.0.1" in self.base_url))
-                    print(f"Debug [Compat]: {'[LOCAL MODEL]' if is_local else ''} Trying token key '{key}'={max_tokens_val}")
+                    # Only show parameter testing for uncached attempts
+                    if not cached_param and len(tried) <= 3:  # Only show first 3 attempts
+                        print(f"   Testing parameter {len(tried)}: '{key}'")
+                else:
+                    if verbose:
+                        print(f"   Testing without max_tokens parameter")
+                
                 payload = attach_modes(payload)
+                
                 try:
-                    resp = self._post_with_retries(url, payload)
+                    # Use reduced retries for parameter testing
+                    test_retries = 1 if len(tried) > 1 else 2
+                    resp = self._post_with_retries(url, payload, max_retries=test_retries)
+                    
+                    # Cache successful parameter for future use
+                    if key and max_tokens_val is not None and not cached_param:
+                        self.cached_max_tokens_param = key
+                        print(f"✅ Parameter '{key}' works - caching for future requests")
+                        
+                        # Persist to database if provider_id is available
+                        if self.provider_id:
+                            try:
+                                from app.core import storage
+                                storage.update_provider(self.provider_id, cached_max_tokens_param=key)
+                            except Exception as e:
+                                if verbose:
+                                    print(f"Warning: Could not persist cached parameter: {e}")
+                    elif key is None and max_tokens_val is not None:
+                        print(f"ℹ️ Model works without max_tokens parameter")
+                    
                     return result_ok(resp)
+                    
                 except httpx.HTTPStatusError as e_send:
                     last_exc = e_send
                     status = e_send.response.status_code if hasattr(e_send, "response") else None
                     body = ""
                     try:
-                        body = e_send.response.text  # type: ignore[assignment]
+                        body = e_send.response.text[:500]  # Limit body size
                     except Exception:
                         pass
                     low = (body or "").lower()
-                    # Retry only on invalid/unsupported parameter errors; otherwise re-raise
-                    if status in (400, 422) and ("unsupported parameter" in low or "unknown parameter" in low or "is not supported" in low or "invalid_request_error" in low):
-                        print(f"Debug [Compat]: Token key '{key}' rejected with {status}; body starts: {low[:120]}")
+                    
+                    # Check if this is a parameter compatibility issue
+                    param_error_keywords = [
+                        "unsupported parameter", "unknown parameter", "is not supported",
+                        "invalid_request_error", "unrecognized parameter", "invalid parameter",
+                        "not a valid parameter", "unexpected parameter", "extra parameter"
+                    ]
+                    
+                    is_param_error = status in (400, 422) and any(kw in low for kw in param_error_keywords)
+                    
+                    if is_param_error and key:
+                        if cached_param == key:
+                            # Cached param no longer works, clear cache
+                            print(f"⚠️ Cached parameter '{key}' no longer works, clearing cache")
+                            self.cached_max_tokens_param = None
+                            cached_param = None
+                            
+                            # Clear from database if provider_id is available
+                            if self.provider_id:
+                                try:
+                                    from app.core import storage
+                                    storage.update_provider(self.provider_id, cached_max_tokens_param=None)
+                                except Exception:
+                                    pass
+                        # Don't print for every failed attempt
+                        if len(tried) <= 3 or verbose:
+                            print(f"   ❌ Parameter '{key}' not supported")
                         continue
-                    raise
-            # If we exhausted all variants, re-raise the last HTTP error if available
+                    elif is_param_error and key is None:
+                        # Even None (no parameter) failed with parameter error
+                        failed_with_none = True
+                        print(f"❌ API rejected request even without max_tokens parameter")
+                        break
+                    
+                    # For non-parameter errors, don't continue testing
+                    if status and status >= 500:
+                        print(f"❌ Server error ({status}), stopping parameter testing")
+                        raise
+                    elif status in (401, 403):
+                        print(f"❌ Authentication error ({status})")
+                        raise
+                    elif status == 429:
+                        print(f"⚠️ Rate limited, stopping parameter testing")
+                        raise
+                    
+                    # Unknown error, try next parameter but limit attempts
+                    if len(tried) >= 5 and not key:  # If we've tried 5+ params and now trying None
+                        print(f"❌ Too many failed attempts, stopping")
+                        raise
+            
+            # If we exhausted all variants, provide helpful error message
             if last_exc is not None:
+                if failed_with_none:
+                    raise httpx.HTTPError(f"API incompatible - rejected all {len(tried)} parameter variants and no-parameter request")
+                elif tried:
+                    print(f"❌ None of {len(tried)} max_tokens parameters worked. Tried: {', '.join(tried[:5])}{'...' if len(tried) > 5 else ''}")
                 raise last_exc
-            # Otherwise, raise a generic HTTP error indicating no variants were tried
-            raise httpx.HTTPError("No compatible max token parameter could be applied")
+            
+            # This should never happen, but handle it gracefully
+            raise httpx.HTTPError("No request could be sent (no variants to try)")
 
         # Try EncA first
         enc_used = "EncA"
@@ -541,10 +819,13 @@ class OAIGateway:
         def result_ok(resp: httpx.Response) -> Dict[str, Any]:
             # First, capture the raw response body before JSON parsing
             raw_body = resp.text
-            print(f"Debug [OAIGateway]: RAW HTTP Response Body:")
-            print(f"=== START RAW RESPONSE ===")
-            print(raw_body)
-            print(f"=== END RAW RESPONSE ===")
+            verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+            
+            if verbose:
+                print(f"Debug [Response]: RAW HTTP Response Body:")
+                print(f"=== START RAW RESPONSE ===")
+                print(raw_body)
+                print(f"=== END RAW RESPONSE ===")
             
             # Try to parse JSON
             try:

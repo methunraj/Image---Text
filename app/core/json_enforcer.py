@@ -57,11 +57,14 @@ def validate_and_repair(
     schema: Dict[str, Any],
     retry_fn: Callable[[str], str | Dict[str, Any]],
     max_retries: int = 2,
+    circuit_breaker: bool = True,
 ) -> Tuple[Optional[Dict[str, Any]], List[str], int]:
-    """Validate JSON against a schema with a repair loop.
+    """Validate JSON against a schema with a repair loop and circuit breaker.
 
     Returns: (json or None, error_messages, attempts_used)
     attempts_used is the number of retry_fn calls performed (0..max_retries).
+    
+    Circuit breaker: If the same errors repeat twice, stop trying to avoid loops.
     """
     validator = Draft202012Validator(schema)
 
@@ -75,6 +78,8 @@ def validate_and_repair(
 
     attempts = 0
     last_errors: List[str] = []
+    previous_errors: List[str] = []
+    repeated_error_count = 0
 
     def parse_if_needed() -> Optional[Dict[str, Any]]:
         nonlocal current_obj, current_text
@@ -96,6 +101,16 @@ def validate_and_repair(
         else:
             # Not parseable
             last_errors = ["/ : Invalid JSON or could not parse text."]
+
+        # Circuit breaker: Check if errors are repeating
+        if circuit_breaker and last_errors == previous_errors:
+            repeated_error_count += 1
+            if repeated_error_count >= 2:
+                last_errors.append("/ : Circuit breaker triggered - same errors repeating")
+                break
+        else:
+            repeated_error_count = 0
+            previous_errors = last_errors.copy()
 
         if attempts >= max_retries:
             break

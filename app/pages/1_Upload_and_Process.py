@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
 
 from app.core import storage
 from app.core.cost import cost_from_usage
+from app.core.json_enforcer import strip_code_fences
 from app.core.provider_openai import OAIGateway
 from app.core.templating import RenderedMessages, render_user_prompt
 from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes, to_xlsx_bytes
@@ -43,21 +44,33 @@ def _sanitize_filename(name: str) -> str:
 def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
     """Save uploaded files with validation and size limits."""
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
+    CHUNK_SIZE = 1024 * 1024  # 1MB chunks for hashing
     saved: List[str] = []
     errors: List[str] = []
     
     for f in files:
         try:
-            data = f.read()
-            if not data:
+            # First check file size without loading entire file
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Reset to beginning
+            
+            if file_size == 0:
                 errors.append(f"{f.name}: Empty file")
                 continue
             
-            # Check file size
-            file_size_mb = len(data) / (1024 * 1024)
-            if len(data) > MAX_FILE_SIZE:
+            file_size_mb = file_size / (1024 * 1024)
+            if file_size > MAX_FILE_SIZE:
                 errors.append(f"{f.name}: Exceeds 10MB limit ({file_size_mb:.1f}MB)")
                 continue
+            
+            # Since we limit to 10MB, just read once for simplicity
+            # The chunked reading was over-optimization for small files
+            f.seek(0)
+            data = f.read()
+            
+            # Hash the data
+            h = hashlib.sha256(data).hexdigest()[:12]
             
             # Validate it's actually an image
             try:
@@ -66,16 +79,17 @@ def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
                 if img.width > 10000 or img.height > 10000:
                     errors.append(f"{f.name}: Image dimensions too large ({img.width}x{img.height})")
                     continue
+                img.close()  # Free memory
             except Exception as img_error:
                 errors.append(f"{f.name}: Invalid image format")
                 continue
             
-            h = hashlib.sha256(data).hexdigest()[:12]
             base = _sanitize_filename(f.name)
             path = UPLOAD_DIR / f"{h}_{base}"
             if not path.exists():
                 path.write_bytes(data)
             saved.append(str(path))
+            
         except MemoryError:
             errors.append(f"{f.name}: Out of memory - file too large")
             continue
@@ -194,14 +208,36 @@ def _process_images(
                     break
     
     # Create gateway with proper timeout
+    # Smart timeout defaults: longer for local models
+    url_lower = (provider.base_url or "").lower()
+    is_local_model = any(indicator in url_lower for indicator in [
+        "localhost", "127.0.0.1", "0.0.0.0", "192.168.",
+        "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+        "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+        "172.28.", "172.29.", "172.30.", "172.31.",  # Private IP range B
+        "host.docker.internal", ".local", ".lan", ":1234", ":5000", ":5001",
+        ":8000", ":8080", ":8888", ":9000", ":11434", ":7860", ":7861"
+    ])
+    
+    # Special check for 10.x.x.x range
+    if not is_local_model and "10." in url_lower:
+        import re
+        if re.search(r'(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
+            is_local_model = True
+    
+    # Use 1 hour timeout to prevent premature timeouts
+    default_timeout = 3600
+    
     gateway = OAIGateway(
         base_url=provider.base_url,
         api_key=api_key,
         headers=provider.headers_json or {},
-        timeout=int(provider.timeout_s or 120),  # Use 120s default, not 30s
+        timeout=int(provider.timeout_s or default_timeout),
         prefer_json_mode=False if unstructured else bool(provider.default_force_json_mode),
         prefer_tools=False if unstructured else bool(provider.default_prefer_tools),
-        detected_caps=provider.detected_caps_json
+        detected_caps=provider.detected_caps_json,
+        cached_max_tokens_param=provider.cached_max_tokens_param,
+        provider_id=provider.id
     )
     
     # Execute request with proper max_tokens
@@ -210,8 +246,11 @@ def _process_images(
     # Ensure max_output_tokens is properly set (default to 4096 if not set)
     max_tokens = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
     
-    # Debug info for users to see what's being sent
-    print(f"Debug: Sending request with max_tokens={max_tokens}, model={provider.model_id}, timeout={provider.timeout_s or 120}s")
+    # Show request configuration
+    print(f"📤 Processing {len(image_paths)} image(s)")
+    print(f"   Model: {provider.model_id}")
+    print(f"   Max tokens: {max_tokens}")
+    print(f"   Timeout: {provider.timeout_s or 120}s")
     
     result = gateway.chat_vision(
         model=provider.model_id or "gpt-4o-mini",
@@ -228,26 +267,31 @@ def _process_images(
     )
     elapsed = time.time() - start_time
     
-    # Process result with debugging
+    # Process result
     output = None
-    print(f"Debug: Raw API result keys: {result.keys()}")
-    print(f"Debug: tool_call_json: {result.get('tool_call_json')}")
-    print(f"Debug: text: {result.get('text')[:200] if result.get('text') else None}")
+    verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+    
+    if verbose:
+        print(f"Debug: Raw API result keys: {result.keys()}")
+        print(f"Debug: tool_call_json: {result.get('tool_call_json')}")
+        print(f"Debug: text preview: {result.get('text')[:200] if result.get('text') else None}")
     
     if unstructured:
         # Always treat as freeform text (Markdown). Do not parse as JSON.
         output = {"raw_text": result.get("text") or "", "format": "markdown"}
-        print("Debug: Unstructured mode - capturing raw text as markdown")
+        if verbose:
+            print("Debug: Unstructured mode - capturing raw text as markdown")
     else:
         if result.get("tool_call_json"):
             output = result["tool_call_json"]
-            print(f"Debug: Using tool_call_json output")
+            print(f"✅ Extracted structured data using tools")
         elif result.get("text"):
             try:
-                output = json.loads(result["text"])
-                print(f"Debug: Successfully parsed JSON from text")
+                # Strip markdown code fences before parsing JSON
+                cleaned_text = strip_code_fences(result["text"])
+                output = json.loads(cleaned_text)
+                print(f"✅ Extracted structured data from JSON response")
             except json.JSONDecodeError as e:
-                print(f"Debug: Failed to parse JSON: {e}")
                 # Try to extract JSON from the text if it's embedded
                 text = result["text"]
                 if "{" in text and "}" in text:
@@ -257,15 +301,16 @@ def _process_images(
                         end = text.rindex("}") + 1
                         json_str = text[start:end]
                         output = json.loads(json_str)
-                        print(f"Debug: Extracted and parsed embedded JSON")
-                    except:
+                        print(f"✅ Extracted embedded JSON from response")
+                    except Exception as extract_error:
                         output = {"raw_text": result["text"]}
-                        print(f"Debug: Could not extract JSON, returning raw text")
+                        if verbose:
+                            print(f"⚠️ Could not parse JSON ({extract_error}), returning raw text")
+                        else:
+                            print(f"⚠️ Could not parse JSON, returning raw text")
                 else:
                     output = {"raw_text": result["text"]}
-                    print(f"Debug: No JSON markers found, returning raw text")
-    
-    print(f"Debug: Final output: {output}")
+                    print(f"⚠️ No JSON found in response, returning raw text")
     
     return {
         "output": output,
@@ -356,7 +401,7 @@ def run() -> None:
                 try:
                     size_kb = Path(pth).stat().st_size / 1024
                     st.text(f"{size_kb:.1f} KB")
-                except:
+                except Exception:
                     st.text("-")
             
             with col4:
@@ -466,10 +511,32 @@ def run() -> None:
         
         # Display results
         if result.get("error"):
-            st.error(f"❌ Error: {result['error']}")
+            # User-friendly error message
+            error_raw = str(result.get("error", ""))
+            error_msg_lower = error_raw.lower()
+            
+            # Provide user-friendly error messages
+            if "timeout" in error_msg_lower:
+                st.error("❌ Request timed out - the model took too long to respond")
+            elif "401" in error_msg_lower or "403" in error_msg_lower or "unauthorized" in error_msg_lower:
+                st.error("❌ Authentication failed - please check your API key")
+            elif "429" in error_msg_lower or "rate limit" in error_msg_lower:
+                st.error("❌ Rate limit exceeded - please wait a moment and try again")
+            elif "404" in error_msg_lower:
+                st.error("❌ Model or endpoint not found - please check your configuration")
+            elif "500" in error_msg_lower or "502" in error_msg_lower or "503" in error_msg_lower:
+                st.error("❌ Server error - the AI service is having issues")
+            elif "connection" in error_msg_lower or "network" in error_msg_lower:
+                st.error("❌ Connection failed - please check your network and endpoint URL")
+            else:
+                # Show simplified error
+                if "httpx." in error_raw or "Exception" in error_raw:
+                    st.error("❌ Processing failed - please try again or check your settings")
+                else:
+                    st.error(f"❌ Error: {error_raw[:200]}")
             
             # Provide helpful suggestions based on error type
-            error_msg = str(result.get("error", "")).lower()
+            error_msg = error_msg_lower
             if "502" in error_msg or "500" in error_msg or "503" in error_msg:
                 st.warning("🔧 **Server Error Detected**")
                 st.write("The provider's server is experiencing issues. Try:")
@@ -495,10 +562,22 @@ def run() -> None:
                 st.write("• Upgrading your API plan for higher limits")
             elif "timeout" in error_msg or "408" in error_msg:
                 st.warning("⏰ **Timeout Error**")
-                st.write("The request took too long. Try:")
-                st.write("• Processing fewer images at once")
-                st.write("• Using smaller images")
-                st.write("• Simplifying your template prompt")
+                # Re-check if local model (is_local was defined earlier but might be out of scope)
+                is_local_error_check = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
+                if is_local_error_check:
+                    st.write("Local models can be slow. Try:")
+                    st.write("• Increasing the timeout in Settings (current: " + str(provider.timeout_s or default_timeout) + "s)")
+                    st.write("• Using a smaller model")
+                    st.write("• Reducing max_output_tokens")
+                    st.write("• Processing one image at a time")
+                    if provider.timeout_s and provider.timeout_s < 300:
+                        st.info("💡 Consider increasing timeout to 300+ seconds for local models")
+                else:
+                    st.write("The request took too long. Try:")
+                    st.write("• Processing fewer images at once")
+                    st.write("• Using smaller images")
+                    st.write("• Simplifying your template prompt")
+                    st.write("• Switching to a faster model")
                 
             # Show debug info
             with st.expander("Debug Information"):
