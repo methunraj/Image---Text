@@ -23,6 +23,7 @@ if str(_ROOT) not in sys.path:
 from app.core import ui as core_ui
 from app.core import storage
 from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path
+from app.core.provider_endpoints import get_provider_base_urls
 from app.core.provider_openai import OpenAIProvider, OAIGateway, tiny_png_data_url
 from app.core.templating import Example, RenderedMessages, render_user_prompt
 
@@ -577,20 +578,9 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def _default_base_url(provider_id: str) -> str:
-    provider_urls = {
-        "openai": "https://api.openai.com/v1",
-        "anthropic": "https://api.anthropic.com/v1",
-        "google": "https://generativelanguage.googleapis.com/v1beta",
-        "mistral": "https://api.mistral.ai/v1",
-        "perplexity": "https://api.perplexity.ai",
-        "groq": "https://api.groq.com/openai/v1",
-        "together": "https://api.together.xyz/v1",
-        "fireworks": "https://api.fireworks.ai/inference/v1",
-        "deepseek": "https://api.deepseek.com/v1",
-        "moonshot": "https://api.moonshot.cn/v1",
-        "openrouter": "https://openrouter.ai/api/v1",
-    }
-    return provider_urls.get((provider_id or "").lower(), "https://api.openai.com/v1")
+    """Compatibility shim: use provider_endpoints catalog for defaults."""
+    options = get_provider_base_urls(provider_id)
+    return (options[0]["url"] if options else "https://api.openai.com/v1")
 
 
 def _api_keys_manager(catalog: Dict[str, Any]) -> None:
@@ -661,7 +651,9 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
     else:
         provider_id = selected_model_info.get("provider_id", "").strip().lower()
         provider_name = selected_model_info.get("provider_name", provider_id)
-        default_base_url = _default_base_url(provider_id)
+        # Resolve base URL options from catalog (with special handling e.g., Alibaba)
+        endpoint_options = get_provider_base_urls(provider_id)
+        default_base_url = (endpoint_options[0]["url"] if endpoint_options else "")
         default_model_id = selected_model_info.get("model_id", "")
         default_headers = {}
 
@@ -691,7 +683,24 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
         col1, col2 = st.columns(2)
         with col1:
             model_id = st.text_input("Model ID", value=default_model_id)
-            base_url = st.text_input("Base URL", value=default_base_url)
+            # If multiple endpoints (e.g., Alibaba), offer a select first
+            base_url = default_base_url
+            if not is_custom:
+                if len(endpoint_options) > 1:
+                    labels = [opt["label"] for opt in endpoint_options]
+                    label_to_url = {opt["label"]: opt["url"] for opt in endpoint_options}
+                    chosen_label = st.selectbox(
+                        "Endpoint",
+                        options=labels,
+                        index=0,
+                        help="Select a predefined endpoint for this provider",
+                    )
+                    base_url = label_to_url.get(chosen_label, default_base_url)
+                else:
+                    # Show the resolved URL (still editable)
+                    pass
+
+            base_url = st.text_input("Base URL", value=base_url)
             if base_url and not base_url.startswith(("http://", "https://")):
                 st.error("Base URL must start with http:// or https://")
 
@@ -917,23 +926,10 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
         default_model_id = selected_model_info.get("model_id", "")
         default_headers = selected_model_info.get("headers", {})
     else:
-        # From catalog - need to determine base URL from provider
-        provider_id = selected_model_info.get("provider_id", "")
-        # Map common providers to their base URLs
-        provider_urls = {
-            "openai": "https://api.openai.com/v1",
-            "anthropic": "https://api.anthropic.com/v1",
-            "google": "https://generativelanguage.googleapis.com/v1beta",
-            "mistral": "https://api.mistral.ai/v1",
-            "perplexity": "https://api.perplexity.ai",
-            "groq": "https://api.groq.com/openai/v1",
-            "together": "https://api.together.xyz/v1",
-            "fireworks": "https://api.fireworks.ai/inference/v1",
-            "deepseek": "https://api.deepseek.com/v1",
-            "moonshot": "https://api.moonshot.cn/v1",
-            "openrouter": "https://openrouter.ai/api/v1"
-        }
-        default_base_url = provider_urls.get(provider_id, "https://api.openai.com/v1")
+        # From catalog - determine base URL(s) from JSON configuration
+        provider_id = selected_model_info.get("provider_id", "").strip().lower()
+        endpoint_options = get_provider_base_urls(provider_id)
+        default_base_url = (endpoint_options[0]["url"] if endpoint_options else "https://api.openai.com/v1")
         default_model_id = selected_model_info.get("model_id", "")
         default_headers = {}
     
@@ -973,9 +969,21 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
                 value=(selected.model_id if selected else default_model_id),
                 help="The model identifier for API calls"
             )
+            # Prefer configured endpoints; allow override
+            resolved_base = (selected.base_url if selected else default_base_url)
+            if not selected_model_info.get("is_custom") and len(endpoint_options) > 1:
+                labels = [opt["label"] for opt in endpoint_options]
+                label_to_url = {opt["label"]: opt["url"] for opt in endpoint_options}
+                chosen_label = st.selectbox(
+                    "Endpoint",
+                    options=labels,
+                    index=0,
+                    help="Select a predefined endpoint for this provider",
+                )
+                resolved_base = label_to_url.get(chosen_label, resolved_base)
             base_url = st.text_input(
                 "Base URL", 
-                value=(selected.base_url if selected else default_base_url),
+                value=resolved_base,
                 help="API endpoint URL"
             )
             # Validate URL

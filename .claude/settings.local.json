@@ -4,7 +4,9 @@
       "Bash(grep:*)",
       "Bash(python3:*)",
       "Bash(python:*)",
-      "Bash(streamlit run:*)"
+      "Bash(streamlit run:*)",
+      "WebFetch(domain:models.dev)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": []

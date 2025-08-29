@@ -1,0 +1,297 @@
+{
+  "validation_status": "PASSED",
+  "total_providers": 41,
+  "total_models": 613,
+  "openai_compatible_providers": 39,
+  "providers_with_documentation": 41,
+  "high_confidence_base_urls": 41,
+  "provider_breakdown": {
+    "xai": {
+      "name": "xAI",
+      "model_count": 17,
+      "openai_compatible": true,
+      "base_url": "https://api.x.ai/v1",
+      "confidence": "high"
+    },
+    "google-vertex-anthropic": {
+      "name": "Vertex",
+      "model_count": 6,
+      "openai_compatible": "",
+      "base_url": "No direct OpenAI-compatible base URL. API calls are made directly to the Vertex AI API endpoint using Google Cloud authentication.",
+      "confidence": "high"
+    },
+    "llama": {
+      "name": "Llama",
+      "model_count": 7,
+      "openai_compatible": true,
+      "base_url": "https://api.llama.com/compat/v1/",
+      "confidence": "high"
+    },
+    "fastrouter": {
+      "name": "FastRouter",
+      "model_count": 14,
+      "openai_compatible": true,
+      "base_url": "https://go.fastrouter.ai/api/v1",
+      "confidence": "high"
+    },
+    "github-models": {
+      "name": "GitHub Models",
+      "model_count": 55,
+      "openai_compatible": true,
+      "base_url": "https://models.github.ai/inference/chat/completions",
+      "confidence": "high"
+    },
+    "deepinfra": {
+      "name": "Deep Infra",
+      "model_count": 4,
+      "openai_compatible": true,
+      "base_url": "https://api.deepinfra.com/v1/openai",
+      "confidence": "high"
+    },
+    "moonshotai-cn": {
+      "name": "Moonshot AI (China)",
+      "model_count": 2,
+      "openai_compatible": true,
+      "base_url": "https://api.moonshot.cn/v1",
+      "confidence": "high"
+    },
+    "zai": {
+      "name": "Z.AI",
+      "model_count": 4,
+      "openai_compatible": true,
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "confidence": "high"
+    },
+    "anthropic": {
+      "name": "Anthropic",
+      "model_count": 10,
+      "openai_compatible": true,
+      "base_url": "https://api.anthropic.com/v1/",
+      "confidence": "high"
+    },
+    "openai": {
+      "name": "OpenAI",
+      "model_count": 23,
+      "openai_compatible": true,
+      "base_url": "https://api.openai.com/v1",
+      "confidence": "high"
+    },
+    "openrouter": {
+      "name": "OpenRouter",
+      "model_count": 89,
+      "openai_compatible": true,
+      "base_url": "https://openrouter.ai/api/v1",
+      "confidence": "high"
+    },
+    "google": {
+      "name": "Google",
+      "model_count": 12,
+      "openai_compatible": true,
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "confidence": "high"
+    },
+    "amazon-bedrock": {
+      "name": "Amazon Bedrock",
+      "model_count": 35,
+      "openai_compatible": true,
+      "base_url": "https://{bedrock-runtime-endpoint}/openai/v1",
+      "confidence": "high"
+    },
+    "chutes": {
+      "name": "Chutes",
+      "model_count": 20,
+      "openai_compatible": true,
+      "base_url": "https://llm.chutes.ai/v1",
+      "confidence": "high"
+    },
+    "opencode": {
+      "name": "opencode",
+      "model_count": 1,
+      "openai_compatible": "",
+      "base_url": "Not applicable, opencode is a platform that integrates with OpenAI-compatible providers, not an OpenAI-compatible provider itself.",
+      "confidence": "high"
+    },
+    "v0": {
+      "name": "v0",
+      "model_count": 3,
+      "openai_compatible": true,
+      "base_url": "https://api.v0.dev/v1",
+      "confidence": "high"
+    },
+    "venice": {
+      "name": "Venice AI",
+      "model_count": 13,
+      "openai_compatible": true,
+      "base_url": "https://api.venice.ai/api/v1",
+      "confidence": "high"
+    },
+    "cloudflare-workers-ai": {
+      "name": "Cloudflare Workers AI",
+      "model_count": 66,
+      "openai_compatible": true,
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+      "confidence": "high"
+    },
+    "inception": {
+      "name": "Inception",
+      "model_count": 2,
+      "openai_compatible": true,
+      "base_url": "https://api.inceptionlabs.ai/v1",
+      "confidence": "high"
+    },
+    "morph": {
+      "name": "Morph",
+      "model_count": 3,
+      "openai_compatible": true,
+      "base_url": "https://api.morphllm.com/v1/chat/completions",
+      "confidence": "high"
+    },
+    "azure": {
+      "name": "Azure",
+      "model_count": 25,
+      "openai_compatible": true,
+      "base_url": "https://YOUR_RESOURCE_NAME.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT_NAME/chat/completions?api-version=YYYY-MM-DD",
+      "confidence": "high"
+    },
+    "requesty": {
+      "name": "Requesty",
+      "model_count": 13,
+      "openai_compatible": true,
+      "base_url": "https://router.requesty.ai/v1",
+      "confidence": "high"
+    },
+    "upstage": {
+      "name": "Upstage",
+      "model_count": 2,
+      "openai_compatible": true,
+      "base_url": "https://console.upstage.ai/api/chat",
+      "confidence": "high"
+    },
+    "modelscope": {
+      "name": "ModelScope",
+      "model_count": 8,
+      "openai_compatible": true,
+      "base_url": "N/A (requires external service like vLLM to expose OpenAI-compatible API)",
+      "confidence": "high"
+    },
+    "github-copilot": {
+      "name": "GitHub Copilot",
+      "model_count": 15,
+      "openai_compatible": true,
+      "base_url": "http://localhost:9191/v1",
+      "confidence": "high"
+    },
+    "wandb": {
+      "name": "Weights & Biases",
+      "model_count": 10,
+      "openai_compatible": true,
+      "base_url": "https://api.inference.wandb.ai/v1",
+      "confidence": "high"
+    },
+    "lmstudio": {
+      "name": "LMStudio",
+      "model_count": 3,
+      "openai_compatible": true,
+      "base_url": "http://localhost:1234/v1",
+      "confidence": "high"
+    },
+    "inference": {
+      "name": "Inference",
+      "model_count": 9,
+      "openai_compatible": true,
+      "base_url": "https://api.inference.net/v1",
+      "confidence": "high"
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "model_count": 2,
+      "openai_compatible": true,
+      "base_url": "https://api.deepseek.com/v1",
+      "confidence": "high"
+    },
+    "moonshotai": {
+      "name": "Moonshot AI",
+      "model_count": 2,
+      "openai_compatible": true,
+      "base_url": "https://api.moonshot.ai/v1",
+      "confidence": "high"
+    },
+    "huggingface": {
+      "name": "Hugging Face",
+      "model_count": 7,
+      "openai_compatible": true,
+      "base_url": "<ENDPOINT_URL>/v1/",
+      "confidence": "high"
+    },
+    "cerebras": {
+      "name": "Cerebras",
+      "model_count": 3,
+      "openai_compatible": true,
+      "base_url": "https://api.cerebras.ai/v1",
+      "confidence": "high"
+    },
+    "zhipuai": {
+      "name": "Zhipu AI",
+      "model_count": 4,
+      "openai_compatible": true,
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+      "confidence": "high"
+    },
+    "fireworks-ai": {
+      "name": "Fireworks AI",
+      "model_count": 6,
+      "openai_compatible": true,
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "confidence": "high"
+    },
+    "vercel": {
+      "name": "Vercel AI Gateway",
+      "model_count": 58,
+      "openai_compatible": true,
+      "base_url": "https://ai-gateway.vercel.sh/v1",
+      "confidence": "high"
+    },
+    "submodel": {
+      "name": "submodel",
+      "model_count": 9,
+      "openai_compatible": true,
+      "base_url": "https://llm.submodel.ai/v1",
+      "confidence": "high"
+    },
+    "google-vertex": {
+      "name": "Vertex",
+      "model_count": 9,
+      "openai_compatible": true,
+      "base_url": "https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi",
+      "confidence": "high"
+    },
+    "groq": {
+      "name": "Groq",
+      "model_count": 16,
+      "openai_compatible": true,
+      "base_url": "https://api.groq.com/openai/v1",
+      "confidence": "high"
+    },
+    "alibaba": {
+      "name": "Alibaba",
+      "model_count": 1,
+      "openai_compatible": true,
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1 (Singapore) or https://dashscope.aliyuncs.com/compatible-mode/v1 (China - Beijing)",
+      "confidence": "high"
+    },
+    "mistral": {
+      "name": "Mistral",
+      "model_count": 19,
+      "openai_compatible": true,
+      "base_url": "https://api.mistral.ai/v1",
+      "confidence": "high"
+    },
+    "togetherai": {
+      "name": "Together AI",
+      "model_count": 6,
+      "openai_compatible": true,
+      "base_url": "https://api.together.xyz/v1",
+      "confidence": "high"
+    }
+  }
+}
