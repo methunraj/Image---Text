@@ -24,6 +24,7 @@ from app.core import ui as core_ui
 from app.core import storage
 from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path
 from app.core.provider_endpoints import get_provider_base_urls
+from app.core.local_models import is_local_provider, list_local_providers, discover_provider_models
 from app.core.provider_openai import OpenAIProvider, OAIGateway, tiny_png_data_url
 from app.core.templating import Example, RenderedMessages, render_user_prompt
 
@@ -443,12 +444,18 @@ def _model_browser(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Two-step model selector grouped by provider."""
-    # Build provider list
+    # Build provider list from catalog
     providers: List[tuple[str, str]] = []  # (provider_id, provider_name)
     for provider_id, provider_data in catalog.items():
         if not isinstance(provider_data, dict) or "models" not in provider_data:
             continue
         providers.append((provider_id, provider_data.get("name", provider_id)))
+
+    # Add local providers (LM Studio, Ollama) if not already present
+    present = {pid for pid, _ in providers}
+    for pid, name in list_local_providers():
+        if pid not in present:
+            providers.append((pid, f"{name} (Local)"))
     if not providers:
         st.info("No providers available in catalog")
         return None
@@ -465,37 +472,41 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
     # Persist selection so other sections can react conditionally
     st.session_state["_selected_provider_code"] = provider_id
 
-    # Require/confirm API key before listing models
-    current_key = _get_api_key_for_provider_code(provider_id)
-    if current_key:
-        st.success("API key loaded for this provider")
+    # Require/confirm API key before listing models (skip for local providers)
+    if is_local_provider(provider_id):
+        st.info("Local provider detected — no API key required.")
         show_models = True
     else:
-        st.warning("No API key saved for this provider.")
-        ik1, ik2 = st.columns([3, 2])
-        with ik1:
-            inline_api = st.text_input(
-                f"API Key ({provider_id})",
-                value="",
-                type="password",
-                key=f"inline_api_top_{provider_id}"
-            )
-        with ik2:
-            kms = _get_kms()
-            default_mode = "encrypted" if kms else "session"
-            inline_mode = st.radio(
-                "Storage",
-                options=["encrypted", "session"] if kms else ["session"],
-                index=(0 if default_mode == "encrypted" else 0),
-                horizontal=True,
-                key=f"inline_mode_top_{provider_id}"
-            )
-        save_top = st.button("Save Provider Key", key=f"inline_save_top_{provider_id}", disabled=not inline_api)
-        if save_top:
-            _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
-            st.success("Saved provider key")
-            st.rerun()
-        show_models = False
+        current_key = _get_api_key_for_provider_code(provider_id)
+        if current_key:
+            st.success("API key loaded for this provider")
+            show_models = True
+        else:
+            st.warning("No API key saved for this provider.")
+            ik1, ik2 = st.columns([3, 2])
+            with ik1:
+                inline_api = st.text_input(
+                    f"API Key ({provider_id})",
+                    value="",
+                    type="password",
+                    key=f"inline_api_top_{provider_id}"
+                )
+            with ik2:
+                kms = _get_kms()
+                default_mode = "encrypted" if kms else "session"
+                inline_mode = st.radio(
+                    "Storage",
+                    options=["encrypted", "session"] if kms else ["session"],
+                    index=(0 if default_mode == "encrypted" else 0),
+                    horizontal=True,
+                    key=f"inline_mode_top_{provider_id}"
+                )
+            save_top = st.button("Save Provider Key", key=f"inline_save_top_{provider_id}", disabled=not inline_api)
+            if save_top:
+                _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
+                st.success("Saved provider key")
+                st.rerun()
+            show_models = False
 
     if not show_models:
         return None
@@ -508,7 +519,34 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
         filter_free = st.checkbox("🆓 Free only", value=False)
 
     # Models under selected provider
-    models = catalog.get(provider_id, {}).get("models", {}) if isinstance(catalog.get(provider_id), dict) else {}
+    if is_local_provider(provider_id):
+        # Discover locally from running server
+        local_cat = discover_provider_models(provider_id)
+        models = local_cat.get("models", {}) if isinstance(local_cat, dict) else {}
+        # Auto-select if only one model available
+        if isinstance(models, dict) and len(models) == 1:
+            mid = next(iter(models.keys()))
+            mdata = models[mid] or {}
+            # Return immediately with auto-selection
+            info = {
+                "provider_id": provider_id,
+                "provider_name": local_cat.get("name", provider_id),
+                "model_id": mid,
+                "name": mdata.get("name", mid),
+                "has_vision": False,
+                "is_free": True,
+                "cost": mdata.get("cost", {"input": 0, "output": 0}),
+                "limit": mdata.get("limit", {}),
+                "modalities": mdata.get("modalities", {"input": ["text"], "output": ["text"]}),
+                "dates": {},
+                "full_data": mdata,
+            }
+            st.success(f"Detected local model: {info['model_id']}")
+            return info
+        if not models:
+            st.warning("No local models detected. Ensure your local server is running.")
+    else:
+        models = catalog.get(provider_id, {}).get("models", {}) if isinstance(catalog.get(provider_id), dict) else {}
     items: List[Dict[str, Any]] = []
     for model_id, model_data in models.items():
         if not isinstance(model_data, dict):
@@ -517,7 +555,11 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
         input_mods = modalities.get("input", []) if isinstance(modalities, dict) else []
         has_vision = "image" in input_mods
         cost = model_data.get("cost", {})
-        is_free = any(v == 0 for v in cost.values() if isinstance(v, (int, float)))
+        # Consider local providers free by default
+        if is_local_provider(provider_id):
+            is_free = True
+        else:
+            is_free = any(v == 0 for v in cost.values() if isinstance(v, (int, float)))
         if filter_vision and not has_vision:
             continue
         if filter_free and not is_free:
@@ -529,7 +571,7 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
             "name": model_data.get("name", model_id),
             "has_vision": has_vision,
             "is_free": is_free,
-            "cost": cost,
+            "cost": cost or ({"input": 0, "output": 0} if is_local_provider(provider_id) else {}),
             "limit": model_data.get("limit", {}),
             "modalities": modalities,
             "dates": model_data.get("dates", {}),
@@ -1177,6 +1219,29 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
                     )
             
             storage.set_active_provider(temp_provider.id)
+            # Quick parameter calibration to capture working max_tokens key for local endpoints
+            try:
+                gateway = OAIGateway(
+                    base_url=base_url,
+                    api_key=(api_key or None) if not local_no_key else None,
+                    headers=headers_json if ok_headers else {},
+                    timeout=int(timeout_s),
+                    prefer_json_mode=False,
+                    prefer_tools=False,
+                    detected_caps=None,
+                    provider_id=temp_provider.id,
+                )
+                _ = gateway.chat_vision(
+                    model=model_id,
+                    system_text="",
+                    user_text="calibrate",
+                    image_paths=[],
+                    fewshot_messages=None,
+                    schema=None,
+                    gen_params={"temperature": 1.0, "max_tokens": 8},
+                )
+            except Exception:
+                pass
             st.success(f"✅ Now using {model_id}")
             st.rerun()
         
@@ -1228,6 +1293,29 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
                                 catalog_caps_json=catalog_info, 
                                 logo_path=logo_path
                             )
+                    # Quick parameter calibration to capture working max_tokens key for local endpoints
+                    try:
+                        gateway = OAIGateway(
+                            base_url=base_url,
+                            api_key=(api_key or None) if not local_no_key else None,
+                            headers=headers_json if ok_headers else {},
+                            timeout=int(timeout_s),
+                            prefer_json_mode=False,
+                            prefer_tools=False,
+                            detected_caps=None,
+                            provider_id=p.id,
+                        )
+                        _ = gateway.chat_vision(
+                            model=model_id,
+                            system_text="",
+                            user_text="calibrate",
+                            image_paths=[],
+                            fewshot_messages=None,
+                            schema=None,
+                            gen_params={"temperature": 1.0, "max_tokens": 8},
+                        )
+                    except Exception:
+                        pass
                     
                     st.success(f"Profile '{profile_name}' saved!")
                     st.session_state["selected_profile"] = profile_name

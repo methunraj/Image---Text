@@ -71,6 +71,9 @@ def get_provider_base_urls(provider_id: str) -> List[Dict[str, str]]:
         "google-vertex": "https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi",
         "amazon-bedrock": "https://{bedrock-runtime-endpoint}/openai/v1",
         "groq": "https://api.groq.com/openai/v1",
+        # Local providers
+        "lmstudio": "http://localhost:1234/v1",
+        "ollama": "http://localhost:11434/v1",
     }
 
     if pid in fallback:
@@ -78,4 +81,3 @@ def get_provider_base_urls(provider_id: str) -> List[Dict[str, str]]:
 
     # Final fallback to OpenAI
     return [{"label": "Default", "url": "https://api.openai.com/v1"}]
-
