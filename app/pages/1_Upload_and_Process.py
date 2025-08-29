@@ -124,30 +124,40 @@ def _image_capable() -> bool:
 
 
 def _get_active_provider_and_key() -> tuple[Optional[storage.Provider], Optional[str]]:
-    """Get active provider and API key."""
+    """Get active provider and corresponding API key (by provider_code)."""
     p = storage.get_active_provider()
     if not p:
         return None, None
+    # Preferred path: provider-scoped key
     api_key: Optional[str] = None
-    if p.key_storage == "session":
-        keys: Dict[int, str] = st.session_state.get("_api_keys", {})
-        api_key = keys.get(p.id)
+    provider_code = (p.provider_code or "").strip().lower()
+    if provider_code:
+        # Check session-scoped key bucket by provider_code
+        sess_keys: Dict[str, str] = st.session_state.get("_provider_api_keys", {})
+        api_key = sess_keys.get(provider_code)
+        if not api_key:
+            # Fallback to persisted, encrypted key
+            api_key = storage.get_decrypted_api_key(provider_code)
     else:
-        try:
-            from cryptography.fernet import Fernet
-            # Prefer env, else use local persisted key (data/kms.key) for automatic setup
-            kms_key = os.getenv("APP_KMS_KEY")
-            if not kms_key:
-                try:
-                    kms_path = Path("data/kms.key")
-                    if kms_path.exists():
-                        kms_key = kms_path.read_text(encoding="utf-8").strip()
-                except Exception:
-                    kms_key = None
-            if kms_key and p.api_key_enc:
-                api_key = Fernet(kms_key).decrypt(p.api_key_enc.encode()).decode()
-        except Exception:
-            api_key = None
+        # Backwards compatibility: use legacy per-profile storage
+        if p.key_storage == "session":
+            keys: Dict[int, str] = st.session_state.get("_api_keys", {})
+            api_key = keys.get(p.id)
+        else:
+            try:
+                from cryptography.fernet import Fernet
+                kms_key = os.getenv("APP_KMS_KEY")
+                if not kms_key:
+                    try:
+                        kms_path = Path("data/kms.key")
+                        if kms_path.exists():
+                            kms_key = kms_path.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        kms_key = None
+                if kms_key and p.api_key_enc:
+                    api_key = Fernet(kms_key).decrypt(p.api_key_enc.encode()).decode()
+            except Exception:
+                api_key = None
     return p, api_key
 
 
@@ -330,7 +340,7 @@ def run() -> None:
     
     # Check capabilities
     if not _image_capable():
-        st.warning("⚠️ Active profile may not support image inputs. Please check Settings.")
+        st.warning("⚠️ Active model may not support image inputs. Please check Settings.")
         if st.button("Go to Settings"):
             st.switch_page("pages/2_Settings.py")
     

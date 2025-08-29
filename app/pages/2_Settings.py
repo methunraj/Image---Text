@@ -61,6 +61,41 @@ def _encrypt(kms: Optional[Fernet], plaintext: str) -> Optional[str]:
 def _decrypt(kms: Optional[Fernet], token: Optional[str]) -> Optional[str]:
     if not kms or not token:
         return None
+
+
+def _get_api_key_for_provider_code(provider_code: str) -> Optional[str]:
+    """Resolve API key for a provider code from session or encrypted DB."""
+    code = (provider_code or "").strip().lower()
+    if not code:
+        return None
+    # Session-stored
+    keys: Dict[str, str] = st.session_state.get("_provider_api_keys", {})
+    if code in keys:
+        return keys[code]
+    # Persisted
+    return storage.get_decrypted_api_key(code)
+
+
+def _set_api_key_for_provider_code(provider_code: str, key_storage: str, new_key: str) -> tuple[str, Optional[str]]:
+    """Set provider-scoped API key.
+
+    Returns (storage_mode, enc_token) where enc_token is for persisted mode.
+    Also updates DB via storage.set_provider_key.
+    """
+    code = (provider_code or "").strip().lower()
+    if not code:
+        return "session", None
+    if key_storage == "session":
+        keys: Dict[str, str] = st.session_state.setdefault("_provider_api_keys", {})
+        if new_key:
+            keys[code] = new_key
+        storage.set_provider_key(code, "session", None)
+        return "session", None
+    # encrypted
+    kms = _get_kms()
+    enc = _encrypt(kms, new_key) if new_key else None
+    storage.set_provider_key(code, "encrypted" if enc else "session", enc)
+    return ("encrypted" if enc else "session"), enc
     try:
         return kms.decrypt(token.encode()).decode()
     except (InvalidToken, Exception):
@@ -403,6 +438,400 @@ def _model_browser(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return selected_model
     
     return None
+
+
+def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Two-step model selector grouped by provider."""
+    # Build provider list
+    providers: List[tuple[str, str]] = []  # (provider_id, provider_name)
+    for provider_id, provider_data in catalog.items():
+        if not isinstance(provider_data, dict) or "models" not in provider_data:
+            continue
+        providers.append((provider_id, provider_data.get("name", provider_id)))
+    if not providers:
+        st.info("No providers available in catalog")
+        return None
+
+    providers.sort(key=lambda x: x[1].lower())
+    provider_display = [f"{name} ({pid})" for pid, name in providers]
+    choice = st.selectbox("Provider", options=["Choose a provider..."] + provider_display)
+    if not choice or choice == "Choose a provider...":
+        # Clear selected provider state if no provider chosen
+        st.session_state["_selected_provider_code"] = ""
+        return None
+    sel_idx = provider_display.index(choice)
+    provider_id, provider_name = providers[sel_idx]
+    # Persist selection so other sections can react conditionally
+    st.session_state["_selected_provider_code"] = provider_id
+
+    # Require/confirm API key before listing models
+    current_key = _get_api_key_for_provider_code(provider_id)
+    if current_key:
+        st.success("API key loaded for this provider")
+        show_models = True
+    else:
+        st.warning("No API key saved for this provider.")
+        ik1, ik2 = st.columns([3, 2])
+        with ik1:
+            inline_api = st.text_input(
+                f"API Key ({provider_id})",
+                value="",
+                type="password",
+                key=f"inline_api_top_{provider_id}"
+            )
+        with ik2:
+            kms = _get_kms()
+            default_mode = "encrypted" if kms else "session"
+            inline_mode = st.radio(
+                "Storage",
+                options=["encrypted", "session"] if kms else ["session"],
+                index=(0 if default_mode == "encrypted" else 0),
+                horizontal=True,
+                key=f"inline_mode_top_{provider_id}"
+            )
+        save_top = st.button("Save Provider Key", key=f"inline_save_top_{provider_id}", disabled=not inline_api)
+        if save_top:
+            _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
+            st.success("Saved provider key")
+            st.rerun()
+        show_models = False
+
+    if not show_models:
+        return None
+
+    # Filters (only after key exists)
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        filter_vision = st.checkbox("🖼️ Vision only", value=False)
+    with fcol2:
+        filter_free = st.checkbox("🆓 Free only", value=False)
+
+    # Models under selected provider
+    models = catalog.get(provider_id, {}).get("models", {}) if isinstance(catalog.get(provider_id), dict) else {}
+    items: List[Dict[str, Any]] = []
+    for model_id, model_data in models.items():
+        if not isinstance(model_data, dict):
+            continue
+        modalities = model_data.get("modalities", {})
+        input_mods = modalities.get("input", []) if isinstance(modalities, dict) else []
+        has_vision = "image" in input_mods
+        cost = model_data.get("cost", {})
+        is_free = any(v == 0 for v in cost.values() if isinstance(v, (int, float)))
+        if filter_vision and not has_vision:
+            continue
+        if filter_free and not is_free:
+            continue
+        items.append({
+            "provider_id": provider_id,
+            "provider_name": provider_name,
+            "model_id": model_id,
+            "name": model_data.get("name", model_id),
+            "has_vision": has_vision,
+            "is_free": is_free,
+            "cost": cost,
+            "limit": model_data.get("limit", {}),
+            "modalities": modalities,
+            "dates": model_data.get("dates", {}),
+            "full_data": model_data
+        })
+
+    items.sort(key=lambda x: x["name"].lower())
+    labels = []
+    mapping = {}
+    for m in items:
+        badges = []
+        if m["has_vision"]:
+            badges.append("🖼️")
+        if m["is_free"]:
+            badges.append("🆓")
+        label = f"{m['name']} ({m['model_id']})" + (f"  [{' '.join(badges)}]" if badges else "")
+        labels.append(label)
+        mapping[label] = m
+
+    selected = st.selectbox("Model", options=["Choose a model..."] + labels)
+    if selected and selected != "Choose a model...":
+        chosen = mapping.get(selected)
+        if chosen:
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    st.markdown(f"**Provider:** {provider_name}")
+                    st.markdown(f"**Model:** {chosen['name']}")
+                with c2:
+                    feats = []
+                    if chosen["has_vision"]:
+                        feats.append("🖼️ Vision")
+                    if chosen["is_free"]:
+                        feats.append("🆓 Free")
+                    ctx = chosen["limit"].get("context")
+                    if ctx:
+                        feats.append(f"📏 {ctx:,} tokens")
+                    if feats:
+                        st.markdown("**Features:** " + ", ".join(feats))
+                with c3:
+                    logo_path = get_logo_path(chosen.get("provider_id", ""))
+                    if logo_path and Path(logo_path).exists():
+                        st.image(logo_path, width=48)
+            return chosen
+    return None
+
+
+def _default_base_url(provider_id: str) -> str:
+    provider_urls = {
+        "openai": "https://api.openai.com/v1",
+        "anthropic": "https://api.anthropic.com/v1",
+        "google": "https://generativelanguage.googleapis.com/v1beta",
+        "mistral": "https://api.mistral.ai/v1",
+        "perplexity": "https://api.perplexity.ai",
+        "groq": "https://api.groq.com/openai/v1",
+        "together": "https://api.together.xyz/v1",
+        "fireworks": "https://api.fireworks.ai/inference/v1",
+        "deepseek": "https://api.deepseek.com/v1",
+        "moonshot": "https://api.moonshot.cn/v1",
+        "openrouter": "https://openrouter.ai/api/v1",
+    }
+    return provider_urls.get((provider_id or "").lower(), "https://api.openai.com/v1")
+
+
+def _api_keys_manager(catalog: Dict[str, Any]) -> None:
+    """Compact provider key manager: add/edit one provider at a time."""
+    st.markdown("#### 🔐 Provider API Keys")
+    st.caption("Save one key per provider; used automatically for matching models")
+
+    # Build provider options from catalog
+    options = []  # list[tuple[pcode, pname]]
+    for pid, pdata in catalog.items():
+        if isinstance(pdata, dict) and "models" in pdata:
+            options.append((pid, pdata.get("name", pid)))
+    options.sort(key=lambda x: x[1].lower())
+    display = [f"{name} ({pid})" for pid, name in options]
+
+    # Show existing configured providers inline
+    existing = storage.list_provider_keys()
+    if existing:
+        st.markdown("Configured:")
+        st.write(" ".join([f"`{rec.provider_code}`" for rec in existing]))
+
+    colA, colB = st.columns([3, 2])
+    with colA:
+        chosen = st.selectbox("Provider", options=["Choose a provider..."] + display, key="key_provider_select")
+    with colB:
+        # Determine selected code
+        code = ""
+        if chosen and chosen != "Choose a provider...":
+            idx = display.index(chosen)
+            code = options[idx][0]
+
+        # Load current mode/value
+        rec = storage.get_provider_key(code) if code else None
+        current_val = _get_api_key_for_provider_code(code) if code else None
+        default_mode = (rec.key_storage if rec else ("encrypted" if _get_kms() else "session"))
+        mode = st.radio("Storage", options=["encrypted", "session"], index=(0 if default_mode == "encrypted" else 1), horizontal=True, key="key_storage_mode")
+
+    # API key field
+    api_val = st.text_input("API Key", value=(current_val or ""), type="password", key="key_api_value", help="Leave blank to keep existing")
+
+    c1, c2, c3 = st.columns([1, 1, 6])
+    with c1:
+        disabled = not code or (not api_val and not current_val)
+        if st.button("Save", disabled=not code):
+            new_val = api_val or (current_val or "")
+            _set_api_key_for_provider_code(code, mode, new_val)
+            st.success("Saved")
+    with c2:
+        if st.button("Delete", disabled=not rec):
+            storage.delete_provider_key(code)
+            # clear session value if exists
+            keys: Dict[str, str] = st.session_state.get("_provider_api_keys", {})
+            keys.pop(code, None)
+            st.warning("Deleted")
+
+
+def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> None:
+    """Streamlined configuration that sets an active model using provider keys."""
+    storage.init_db()
+
+    is_custom = bool(selected_model_info.get("is_custom"))
+    if is_custom:
+        provider_id = st.text_input("Provider Code", value=(selected_model_info.get("provider_name") or "openai")).strip().lower()
+        default_base_url = selected_model_info.get("base_url", "")
+        default_model_id = selected_model_info.get("model_id", "")
+        default_headers = selected_model_info.get("headers", {})
+        provider_name = selected_model_info.get("provider_name", provider_id or "Custom")
+    else:
+        provider_id = selected_model_info.get("provider_id", "").strip().lower()
+        provider_name = selected_model_info.get("provider_name", provider_id)
+        default_base_url = _default_base_url(provider_id)
+        default_model_id = selected_model_info.get("model_id", "")
+        default_headers = {}
+
+    with st.container(border=True):
+        col_info, col_logo = st.columns([4, 1])
+        with col_info:
+            st.markdown(f"**Selected Model:** {selected_model_info.get('name', selected_model_info.get('model_id'))}")
+            st.caption(f"Provider: {provider_name} [{provider_id or 'custom'}]")
+            if not is_custom:
+                badges = []
+                if selected_model_info.get("has_vision"):
+                    badges.append("🖼️ Vision")
+                if selected_model_info.get("is_free"):
+                    badges.append("🆓 Free")
+                ctx = selected_model_info.get("limit", {}).get("context")
+                if ctx:
+                    badges.append(f"📏 {ctx:,} tokens")
+                if badges:
+                    st.write(" · ".join(badges))
+        with col_logo:
+            if not is_custom:
+                logo_path = get_logo_path(provider_id)
+                if logo_path and Path(logo_path).exists():
+                    st.image(logo_path, width=80)
+
+        st.divider()
+        col1, col2 = st.columns(2)
+        with col1:
+            model_id = st.text_input("Model ID", value=default_model_id)
+            base_url = st.text_input("Base URL", value=default_base_url)
+            if base_url and not base_url.startswith(("http://", "https://")):
+                st.error("Base URL must start with http:// or https://")
+
+            url_lower = base_url.lower() if base_url else ""
+            is_local = any(indicator in url_lower for indicator in [
+                "localhost", "127.0.0.1", "0.0.0.0", "192.168.",
+                "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+                "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+                "172.28.", "172.29.", "172.30.", "172.31.",
+                "host.docker.internal", ".local", ".lan", ":1234", ":5000", ":5001",
+                ":8000", ":8080", ":8888", ":9000", ":11434", ":7860", ":7861"
+            ])
+            if not is_local and "10." in url_lower:
+                import re
+                if re.search(r"(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}", url_lower):
+                    is_local = True
+
+            default_timeout = 300 if is_local else 120
+            timeout_s = st.number_input("⏱️ Request Timeout (seconds)", min_value=30, max_value=600, value=int(default_timeout), step=30)
+
+            # Adapt token limits to model's published limit if available
+            model_limits = selected_model_info.get("limit", {}) if isinstance(selected_model_info.get("limit", {}), dict) else {}
+            limit_output = model_limits.get("output")
+            try:
+                limit_output_int = int(limit_output) if limit_output is not None else None
+            except Exception:
+                limit_output_int = None
+
+            ui_max_tokens = limit_output_int if (isinstance(limit_output_int, int) and limit_output_int > 0) else 32768
+            default_tokens = int(limit_output_int or 4096)
+            # Clamp default within min/max bounds to satisfy Streamlit API
+            default_tokens = max(256, min(default_tokens, ui_max_tokens))
+
+            max_output_tokens = st.number_input(
+                "Max Output Tokens 📝",
+                min_value=256,
+                max_value=int(ui_max_tokens),
+                step=256,
+                value=int(default_tokens),
+            )
+            temperature = st.slider("Temperature 🌡️", min_value=0.0, max_value=2.0, value=1.0, step=0.1)
+
+        with col2:
+            headers_json, ok_headers = _json_input("Headers JSON (optional)", value=default_headers, key="hdrs", height=140)
+            st.markdown("**Advanced Options**")
+            force_json = st.checkbox("Force JSON Mode", value=False)
+            prefer_tools = st.checkbox("Prefer Tools (function calling)", value=False)
+            st.markdown("**Authentication**")
+            if is_custom:
+                # Custom flow: allow inline key entry here (since provider is user-defined)
+                skip_key = st.checkbox("Skip API Key (local endpoints only)")
+                current_key = _get_api_key_for_provider_code(provider_id) if provider_id else None
+                if not skip_key and provider_id:
+                    if is_local:
+                        st.info("Local endpoint detected; API key not required.")
+                    elif current_key:
+                        st.success("API key saved for this provider")
+                    else:
+                        ik1, ik2 = st.columns([3, 2])
+                        with ik1:
+                            inline_api = st.text_input(
+                                f"API Key ({provider_id or 'provider'})",
+                                value="",
+                                type="password",
+                                key=f"inline_api_custom_{provider_id}"
+                            )
+                        with ik2:
+                            kms = _get_kms()
+                            default_mode = "encrypted" if kms else "session"
+                            inline_mode = st.radio(
+                                "Storage",
+                                options=["encrypted", "session"] if kms else ["session"],
+                                index=(0 if default_mode == "encrypted" else 0),
+                                horizontal=True,
+                                key=f"inline_mode_custom_{provider_id}"
+                            )
+                        if st.button("Save Provider Key", key=f"inline_save_custom_{provider_id}", disabled=not inline_api):
+                            _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
+                            st.success("Saved provider key")
+                            st.rerun()
+            else:
+                # Catalog providers: key handled at provider selection step; just show status here
+                current_key = _get_api_key_for_provider_code(provider_id) if provider_id else None
+                st.info("API key loaded" if current_key else "No API key saved for this provider")
+                skip_key = False
+
+            st.divider()
+            b1, b2 = st.columns([1, 1])
+            with b1:
+                test_clicked = st.button("🧪 Test Connection")
+            with b2:
+                apply_clicked = st.button("▶️ Set Active Model", type="primary")
+
+        if test_clicked:
+            api_key = current_key or ""
+            if not skip_key and not is_local and not api_key:
+                st.error("No API key available. Save a key first or enable 'Skip API Key'.")
+            else:
+                with st.spinner("Testing connection..."):
+                    ping_result = _ping_chat(base_url, api_key, model_id, headers_json or {}, timeout_s)
+                if ping_result["status"] == "success":
+                    st.success(ping_result["message"])
+                else:
+                    st.error(ping_result["message"])
+                    if ping_result.get("details"):
+                        with st.expander("Error Details"):
+                            st.json(ping_result["details"])
+
+        if apply_clicked:
+            if not model_id or not base_url:
+                st.error("Model ID and Base URL are required")
+            elif not skip_key and not is_local and not current_key:
+                st.error("No API key saved for this provider. Add it in 'Provider API Keys' or enable 'Skip API Key'.")
+            else:
+                active_row = storage.get_active_provider()
+                if not active_row:
+                    active_row = storage.create_provider("Active Model", base_url)
+                updated = storage.update_provider(
+                    active_row.id,
+                    name="Active Model",
+                    base_url=base_url,
+                    provider_code=provider_id or None,
+                    model_id=model_id,
+                    headers_json=headers_json if ok_headers else {},
+                    timeout_s=float(timeout_s),
+                    key_storage="session",
+                    api_key_enc=None,
+                    default_max_output_tokens=max_output_tokens,
+                    default_temperature=float(temperature),
+                    default_force_json_mode=bool(force_json),
+                    default_prefer_tools=bool(prefer_tools),
+                )
+                if not is_custom:
+                    catalog_info = lookup_model(model_id)
+                    if catalog_info:
+                        logo_path = get_logo_path(catalog_info.get("provider_id", ""))
+                        storage.update_provider(updated.id, catalog_caps_json=catalog_info, logo_path=logo_path)
+                storage.set_active_provider(updated.id)
+                st.success(f"✅ Now using {model_id}")
+                st.rerun()
 
 
 def _custom_model_form() -> Optional[Dict[str, Any]]:
@@ -1213,6 +1642,72 @@ def run() -> None:
             else:
                 st.info("👆 Select a model from the catalog or add a custom model to configure connection settings")
     
+    with tab_template:
+        st.markdown("### Manage Templates")
+        st.caption("Create and manage prompt templates for consistent extraction")
+        _template_management()
+
+
+# Override old run() with streamlined workflow
+def run() -> None:  # type: ignore[no-redef]
+    load_dotenv(override=False)
+    st.title("Settings")
+    storage.init_db()
+
+    # Sidebar: show active model
+    active = storage.get_active_provider()
+    with st.sidebar:
+        prof_name = (active.model_id or active.name) if active else "None"
+        logo = active.logo_path if active else None
+        core_ui.status_chip("Active Model", prof_name, logo_path=logo)
+
+    # Tabs
+    tab_model, tab_template = st.tabs(["🤖 Model", "📝 Template"])
+
+    with tab_model:
+        st.markdown("### Configure AI Model")
+        st.caption("Pick a provider/model; if a key is missing you can add it inline.")
+
+        catalog = get_cached_catalog()
+        st.markdown("#### Select Model")
+        tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
+
+        selected_model_info = None
+        with tab_catalog:
+            if catalog:
+                selected_model_info = _grouped_model_selector(catalog)
+                if selected_model_info:
+                    st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
+                    st.session_state["selected_model"] = selected_model_info
+            else:
+                st.error("Could not load models catalog")
+
+        with tab_custom:
+            custom_info = _custom_model_form()
+            if custom_info:
+                selected_model_info = custom_info
+                st.success(f"✅ Using custom model: {custom_info['model_id']}")
+                st.session_state["selected_model"] = selected_model_info
+
+        if not selected_model_info and "selected_model" in st.session_state:
+            # Rehydrate previous selection from session, but only if the provider key exists
+            maybe_saved = st.session_state["selected_model"]
+            pid = (maybe_saved or {}).get("provider_id")
+            if pid and _get_api_key_for_provider_code(pid):
+                selected_model_info = maybe_saved
+            else:
+                # Drop stale selection without key
+                selected_model_info = None
+
+        if selected_model_info:
+            st.divider()
+            st.markdown("### Connection Configuration")
+            _streamlined_model_configuration(selected_model_info)
+        else:
+            st.info("👆 Select a provider and model, or add a custom model")
+
+        # Advanced key management removed from default flow to avoid duplicate key entry points
+
     with tab_template:
         st.markdown("### Manage Templates")
         st.caption("Create and manage prompt templates for consistent extraction")

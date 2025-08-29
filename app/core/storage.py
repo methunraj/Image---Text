@@ -22,6 +22,8 @@ class Provider(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     base_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Logical provider code (e.g., 'openai', 'openrouter') for API key lookup
+    provider_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Security
     key_storage: Mapped[str] = mapped_column(String(16), default="session")  # 'session' | 'encrypted'
     api_key_enc: Mapped[str | None] = mapped_column(String(2048), nullable=True)
@@ -46,6 +48,16 @@ class Provider(Base):
     created_at: Mapped[datetime] = mapped_column(default=func.now())
 
     runs: Mapped[list[Run]] = relationship(back_populates="provider", cascade="all, delete-orphan")  # type: ignore[name-defined]
+
+
+class ProviderKey(Base):
+    __tablename__ = "provider_keys"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # e.g., 'openai', 'openrouter', 'groq'
+    provider_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    key_storage: Mapped[str] = mapped_column(String(16), default="encrypted")  # 'session' | 'encrypted'
+    api_key_enc: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
 
 
 class Template(Base):
@@ -131,6 +143,7 @@ def _run_migrations() -> None:
         add_map = {
             "key_storage": "TEXT",
             "api_key_enc": "TEXT",
+            "provider_code": "TEXT",
             "model_id": "TEXT",
             "headers_json": "JSON",
             "timeout_s": "REAL",
@@ -172,6 +185,44 @@ def get_db() -> Session:
         init_db()
     assert _SessionLocal is not None
     return _SessionLocal()
+
+
+# --- Optional encryption helpers for persistent API keys ---
+def _get_kms_key() -> str | None:
+    """Return APP_KMS_KEY from env or auto-managed data/kms.key contents."""
+    key = os.getenv("APP_KMS_KEY")
+    if key:
+        return key
+    try:
+        path = Path("data/kms.key")
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+        # Auto-create if none exists
+        from cryptography.fernet import Fernet  # type: ignore
+        path.parent.mkdir(parents=True, exist_ok=True)
+        k = Fernet.generate_key().decode()
+        path.write_text(k, encoding="utf-8")
+        return k
+    except Exception:
+        return None
+
+
+def get_decrypted_api_key(provider_code: str) -> str | None:
+    """Return decrypted API key for provider_code if stored encrypted.
+
+    Session-stored secrets are handled in UI; this only returns persisted keys.
+    """
+    rec = get_provider_key(provider_code)
+    if not rec or rec.key_storage != "encrypted" or not rec.api_key_enc:
+        return None
+    try:
+        key = _get_kms_key()
+        if not key:
+            return None
+        from cryptography.fernet import Fernet  # type: ignore
+        return Fernet(key).decrypt(rec.api_key_enc.encode()).decode()
+    except Exception:
+        return None
 
 
 # Simple DAO stubs
@@ -314,3 +365,52 @@ def set_active_provider(pid: int) -> None:
 def get_active_provider() -> Provider | None:
     with get_db() as db:
         return db.query(Provider).filter(Provider.is_active == True).first()  # noqa: E712
+
+
+# Provider API key management (by provider_code)
+def list_provider_keys() -> list[ProviderKey]:
+    with get_db() as db:
+        return db.query(ProviderKey).order_by(ProviderKey.provider_code.asc()).all()
+
+
+def get_provider_key(provider_code: str) -> ProviderKey | None:
+    if not provider_code:
+        return None
+    with get_db() as db:
+        return (
+            db.query(ProviderKey)
+            .filter(ProviderKey.provider_code == provider_code.strip().lower())
+            .first()
+        )
+
+
+def set_provider_key(provider_code: str, key_storage: str, api_key_enc: str | None) -> ProviderKey:
+    """Create or update the provider key record for a provider_code.
+
+    key_storage: 'session' or 'encrypted'. If 'session', api_key_enc is ignored and set to None.
+    """
+    code = provider_code.strip().lower()
+    storage_mode = key_storage if key_storage in ("session", "encrypted") else "encrypted"
+    enc = (api_key_enc if storage_mode == "encrypted" else None)
+    with get_db() as db:
+        rec = db.query(ProviderKey).filter(ProviderKey.provider_code == code).first()
+        if rec:
+            rec.key_storage = storage_mode
+            rec.api_key_enc = enc
+            db.add(rec)
+        else:
+            rec = ProviderKey(provider_code=code, key_storage=storage_mode, api_key_enc=enc)
+            db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
+
+
+def delete_provider_key(provider_code: str) -> None:
+    if not provider_code:
+        return
+    with get_db() as db:
+        rec = db.query(ProviderKey).filter(ProviderKey.provider_code == provider_code.strip().lower()).first()
+        if rec:
+            db.delete(rec)
+            db.commit()

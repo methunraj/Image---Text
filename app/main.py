@@ -19,10 +19,10 @@ from app.core.models_dev import cache_provider_logo
 
 
 def _get_active_profile() -> tuple[str, str | None]:
-    """Resolve the active profile and logo from DB or env."""
+    """Resolve the active model/profile and logo from DB or env."""
     p = storage.get_active_provider()
     if p:
-        name = p.name
+        name = p.model_id or p.name
         logo = p.logo_path
         # If not stored but catalog has provider, try to cache
         if not logo and p.catalog_caps_json and isinstance(p.catalog_caps_json, dict):
@@ -62,7 +62,7 @@ def main() -> None:
         st.markdown("#### Navigation")
         st.markdown("<hr>", unsafe_allow_html=True)
         prof_name, logo = _get_active_profile()
-        core_ui.status_chip("Active Profile", prof_name, logo_path=logo)
+        core_ui.status_chip("Active Model", prof_name, logo_path=logo)
 
     # Clean title with muted subtitle
     st.title("🧩 Images -> JSON")
@@ -86,8 +86,8 @@ def main() -> None:
         # Quick stats if we have data
         try:
             templates = storage.list_templates()
-            providers = storage.list_providers()
-            st.markdown(f"**Status:** {len(templates)} templates • {len(providers)} providers configured")
+            keys = storage.list_provider_keys()
+            st.markdown(f"**Status:** {len(templates)} templates • {len(keys)} providers with API keys")
         except Exception:
             pass
 
