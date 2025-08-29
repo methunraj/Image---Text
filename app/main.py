@@ -31,10 +31,15 @@ def _get_active_profile() -> tuple[str, str | None]:
                 logo = cache_provider_logo(provider)
         return name, logo
     # fallback
-    try:
-        profile = st.secrets.get("APP_PROFILE")  # type: ignore[attr-defined]
-    except Exception:
-        profile = None
+    profile = None
+    # Only read st.secrets if a secrets.toml exists to avoid noisy warnings
+    project_secrets = _ROOT / ".streamlit" / "secrets.toml"
+    user_secrets = Path.home() / ".streamlit" / "secrets.toml"
+    if project_secrets.exists() or user_secrets.exists():
+        try:
+            profile = st.secrets.get("APP_PROFILE")  # type: ignore[attr-defined]
+        except Exception:
+            profile = None
     name = str(profile) if profile else os.getenv("APP_PROFILE", "Default")
     return name, None
 
