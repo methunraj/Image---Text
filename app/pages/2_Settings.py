@@ -504,7 +504,8 @@ def _grouped_model_selector(catalog: Dict[str, Any]) -> Optional[Dict[str, Any]]
             save_top = st.button("Save Provider Key", key=f"inline_save_top_{provider_id}", disabled=not inline_api)
             if save_top:
                 _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
-                st.success("Saved provider key")
+                st.success("✅ Provider key saved! Models will now be displayed.")
+                st.session_state.provider_key_saved_catalog = True
                 st.rerun()
             show_models = False
 
@@ -685,7 +686,9 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
 
     is_custom = bool(selected_model_info.get("is_custom"))
     if is_custom:
-        provider_id = st.text_input("Provider Code", value=(selected_model_info.get("provider_name") or "openai")).strip().lower()
+        # Store provider ID in session state to preserve across reruns
+        provider_id_input = st.text_input("Provider Code", value=(selected_model_info.get("provider_name") or "openai"), key="provider_code_input")
+        provider_id = provider_id_input.strip().lower()
         default_base_url = selected_model_info.get("base_url", "")
         default_model_id = selected_model_info.get("model_id", "")
         default_headers = selected_model_info.get("headers", {})
@@ -724,7 +727,11 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
-            model_id = st.text_input("Model ID", value=default_model_id)
+            # Store form values in session state
+            if "model_id_value" not in st.session_state:
+                st.session_state.model_id_value = default_model_id
+            model_id = st.text_input("Model ID", value=st.session_state.model_id_value, key="model_id_streamlined")
+            st.session_state.model_id_value = model_id
             # If multiple endpoints (e.g., Alibaba), offer a select first
             base_url = default_base_url
             if not is_custom:
@@ -742,7 +749,11 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
                     # Show the resolved URL (still editable)
                     pass
 
-            base_url = st.text_input("Base URL", value=base_url)
+            # Store base URL in session state
+            if "base_url_value" not in st.session_state:
+                st.session_state.base_url_value = base_url
+            base_url = st.text_input("Base URL", value=st.session_state.base_url_value, key="base_url_streamlined")
+            st.session_state.base_url_value = base_url
             if base_url and not base_url.startswith(("http://", "https://")):
                 st.error("Base URL must start with http:// or https://")
 
@@ -771,19 +782,31 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
             except Exception:
                 limit_output_int = None
 
-            ui_max_tokens = limit_output_int if (isinstance(limit_output_int, int) and limit_output_int > 0) else 32768
+            # Much higher limit to support all models (1M tokens)
+            ui_max_tokens = 1000000  # Support up to 1M tokens
             default_tokens = int(limit_output_int or 4096)
             # Clamp default within min/max bounds to satisfy Streamlit API
             default_tokens = max(256, min(default_tokens, ui_max_tokens))
+
+            # Use session state to preserve value across reruns
+            if "max_output_tokens_value" not in st.session_state:
+                st.session_state.max_output_tokens_value = default_tokens
 
             max_output_tokens = st.number_input(
                 "Max Output Tokens 📝",
                 min_value=256,
                 max_value=int(ui_max_tokens),
                 step=256,
-                value=int(default_tokens),
+                value=st.session_state.max_output_tokens_value,
+                key="max_output_tokens_streamlined",
+                help="Maximum tokens the model can generate. Most models support 4K-128K. Some support up to 1M tokens."
             )
-            temperature = st.slider("Temperature 🌡️", min_value=0.0, max_value=2.0, value=1.0, step=0.1)
+            st.session_state.max_output_tokens_value = max_output_tokens
+            # Store temperature in session state
+            if "temperature_value" not in st.session_state:
+                st.session_state.temperature_value = 1.0
+            temperature = st.slider("Temperature 🌡️", min_value=0.0, max_value=2.0, value=st.session_state.temperature_value, step=0.1, key="temperature_streamlined")
+            st.session_state.temperature_value = temperature
 
         with col2:
             headers_json, ok_headers = _json_input("Headers JSON (optional)", value=default_headers, key="hdrs", height=140)
@@ -821,8 +844,8 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
                             )
                         if st.button("Save Provider Key", key=f"inline_save_custom_{provider_id}", disabled=not inline_api):
                             _set_api_key_for_provider_code(provider_id, inline_mode, inline_api)
-                            st.success("Saved provider key")
-                            st.rerun()
+                            st.session_state.provider_key_saved = True
+                            st.success("✅ Provider key saved! You can now use 'Set Active Model'.")
             else:
                 # Catalog providers: key handled at provider selection step; just show status here
                 current_key = _get_api_key_for_provider_code(provider_id) if provider_id else None
@@ -882,12 +905,27 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
                         storage.update_provider(updated.id, catalog_caps_json=catalog_info, logo_path=logo_path)
                 storage.set_active_provider(updated.id)
                 st.success(f"✅ Now using {model_id}")
+                # Clear saved form state to reset for next config
+                for key in ["model_id_value", "base_url_value", "max_output_tokens_value", "temperature_value"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
                 st.rerun()
 
 
 def _custom_model_form() -> Optional[Dict[str, Any]]:
     """Display custom model form and return model info if submitted."""
     st.markdown("Enter details for a model not in the catalog:")
+    
+    # Add a clear button to reset the form
+    col_clear, col_space = st.columns([1, 4])
+    with col_clear:
+        if st.button("🔄 Reset Form", help="Clear all custom model fields"):
+            # Clear custom model fields
+            for key in ['custom_model_id', 'custom_provider', 'custom_base_url', 'custom_headers', 
+                       'custom_model_selected', 'selected_model']:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
     
     # Add provider-specific guidance
     with st.info("ℹ️ Provider-Specific Notes"):
@@ -904,30 +942,54 @@ def _custom_model_form() -> Optional[Dict[str, Any]]:
         - Some models have hardcoded 175-200 token limits
         """)
     
+    # Use session state to preserve form values
     col1, col2 = st.columns(2)
     with col1:
+        if 'custom_model_id' not in st.session_state:
+            st.session_state.custom_model_id = ""
         custom_model_id = st.text_input(
             "Model ID", 
+            value=st.session_state.custom_model_id,
             placeholder="e.g., my-local-llama, openai/gpt-4-vision-preview",
-            help="For OpenRouter, include provider prefix (e.g., 'openai/gpt-4-vision-preview')"
+            help="For OpenRouter, include provider prefix (e.g., 'openai/gpt-4-vision-preview')",
+            key="custom_model_id_input"
         )
+        st.session_state.custom_model_id = custom_model_id
+        
+        if 'custom_provider' not in st.session_state:
+            st.session_state.custom_provider = ""
         custom_provider = st.text_input(
             "Provider Name (optional)", 
+            value=st.session_state.custom_provider,
             placeholder="e.g., LM Studio, OpenRouter",
-            help="Display name for the provider"
+            help="Display name for the provider",
+            key="custom_provider_input"
         )
+        st.session_state.custom_provider = custom_provider
+        
     with col2:
+        if 'custom_base_url' not in st.session_state:
+            st.session_state.custom_base_url = ""
         custom_base_url = st.text_input(
             "Base URL", 
+            value=st.session_state.custom_base_url,
             placeholder="e.g., http://localhost:1234/v1 or https://openrouter.ai/api/v1",
-            help="API endpoint URL (without /chat/completions)"
+            help="API endpoint URL (without /chat/completions)",
+            key="custom_base_url_input"
         )
+        st.session_state.custom_base_url = custom_base_url
+        
+        if 'custom_headers' not in st.session_state:
+            st.session_state.custom_headers = ""
         custom_headers = st.text_area(
             "Headers JSON (optional)",
+            value=st.session_state.custom_headers,
             placeholder='{"HTTP-Referer": "your-app", "X-Title": "MyApp"}',
             height=100,
-            help="OpenRouter may require HTTP-Referer header"
+            help="OpenRouter may require HTTP-Referer header",
+            key="custom_headers_input"
         )
+        st.session_state.custom_headers = custom_headers
     
     if st.button("Use Custom Model", type="primary", disabled=not (custom_model_id and custom_base_url)):
         # Parse headers if provided
@@ -939,13 +1001,18 @@ def _custom_model_form() -> Optional[Dict[str, Any]]:
                 st.error(f"Invalid headers JSON: {e}")
                 return None
         
-        return {
+        # Store the custom model selection in session state
+        custom_model_data = {
             "model_id": custom_model_id,
             "provider_name": custom_provider or "Custom",
             "base_url": custom_base_url,
             "headers": headers,
             "is_custom": True
         }
+        st.session_state["custom_model_selected"] = True
+        st.session_state["selected_model"] = custom_model_data
+        
+        return custom_model_data
     
     return None
 
@@ -1060,14 +1127,20 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
                 help=f"How long to wait for model response. {'Local models may need more time (300s recommended).' if is_local else 'Cloud APIs typically respond within 120s.'}"
             )
             
+            # Use session state to preserve value across reruns
+            if "max_tokens_config_value" not in st.session_state:
+                st.session_state.max_tokens_config_value = int(selected.default_max_output_tokens if selected else 4096)
+            
             max_output_tokens = st.number_input(
                 "Max Output Tokens 📝", 
-                min_value=100, 
-                max_value=32768, 
-                value=int(selected.default_max_output_tokens if selected else 4096),
+                min_value=256, 
+                max_value=1000000,  # Support up to 1M tokens
+                value=st.session_state.max_tokens_config_value,
                 step=512,
-                help="Maximum tokens the model can generate. Increase for longer outputs (default: 4096)."
+                key="max_tokens_config",
+                help="Maximum tokens the model can generate. Most models support 4K-128K. Some support up to 1M tokens."
             )
+            st.session_state.max_tokens_config_value = max_output_tokens
 
             temperature = st.number_input(
                 "Temperature",
@@ -1351,6 +1424,14 @@ def _template_management() -> None:
     """Display template management interface."""
     storage.init_db()
     
+    # Check if template was just saved
+    if st.session_state.get("template_saved"):
+        saved_name = st.session_state.get("saved_template_name", "")
+        st.success(f"✅ Template '{saved_name}' has been saved successfully!")
+        del st.session_state["template_saved"]
+        if "saved_template_name" in st.session_state:
+            del st.session_state["saved_template_name"]
+    
     templates = storage.list_templates()
     name_to_tpl = {t.name: t for t in templates}
     names = [t.name for t in templates]
@@ -1547,7 +1628,10 @@ Respond ONLY with JSON."""
                 user_prompt=user_prompt or None,
                 yaml_blob=yaml_blob,
             )
-            st.success("Template created")
+            st.success("✅ Template created successfully!")
+            # Save the success state and template name to session
+            st.session_state.template_saved = True
+            st.session_state.saved_template_name = name.strip()
             st.rerun()
         else:
             storage.update_template(
@@ -1560,7 +1644,10 @@ Respond ONLY with JSON."""
                 examples_json=[asdict(e) for e in examples],
                 yaml_blob=yaml_blob,
             )
-            st.success("Template saved")
+            st.success("✅ Template saved successfully!")
+            # Save the success state and template name to session
+            st.session_state.template_saved = True
+            st.session_state.saved_template_name = name.strip()
             st.rerun()
 
     if clone_clicked and tpl:
@@ -1685,6 +1772,11 @@ def run() -> None:
                         st.error("Could not load models catalog")
                 
                 with tab_custom:
+                    # Check if custom model was already selected
+                    if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
+                        selected_model_info = st.session_state["selected_model"]
+                        st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
+                    
                     custom_info = _custom_model_form()
                     if custom_info:
                         selected_model_info = custom_info
@@ -1721,6 +1813,11 @@ def run() -> None:
                     st.error("Could not load models catalog")
             
             with tab_custom:
+                # Check if custom model was already selected
+                if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
+                    selected_model_info = st.session_state["selected_model"]
+                    st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
+                
                 custom_info = _custom_model_form()
                 if custom_info:
                     selected_model_info = custom_info
@@ -1779,6 +1876,11 @@ def run() -> None:  # type: ignore[no-redef]
                 st.error("Could not load models catalog")
 
         with tab_custom:
+            # Check if custom model was already selected
+            if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
+                selected_model_info = st.session_state["selected_model"]
+                st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
+            
             custom_info = _custom_model_form()
             if custom_info:
                 selected_model_info = custom_info

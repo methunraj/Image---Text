@@ -491,7 +491,7 @@ def run() -> None:
         st.write(f"**API Endpoint:** {provider.base_url}")
     
     # Output mode toggle and Process button
-    col1, col2 = st.columns([1, 5])
+    col1, col2, col3 = st.columns([1, 4, 1])
     with col1:
         # Minimal, per-run toggle to avoid DB/schema changes
         unstructured = st.checkbox("Unstructured (Markdown)", help="Skip schema; return plain text/Markdown.")
@@ -501,6 +501,34 @@ def run() -> None:
             type="primary",
             use_container_width=True
         )
+    with col3:
+        # Clear results button
+        if 'last_result' in st.session_state:
+            if st.button("🗑️ Clear", help="Clear cached results"):
+                # Clear all cached data
+                keys_to_clear = ['last_result', 'last_template_name', 'last_images', 
+                               'processing_timestamp', 'last_unstructured', 'export_data',
+                               'last_debug_info', 'last_usage', 'cumulative_cost']
+                for key in keys_to_clear:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+    
+    # Check for cached results first
+    show_cached = False
+    if 'last_result' in st.session_state and not process_clicked:
+        # Check if the cached result is for the same template and images
+        cached_template = st.session_state.get('last_template_name', '')
+        cached_images = st.session_state.get('last_images', [])
+        
+        if cached_template == selected_template_name and set(cached_images) == set(selected):
+            show_cached = True
+            result = st.session_state['last_result']
+            cached_time = st.session_state.get('processing_timestamp', 0)
+            time_ago = time.time() - cached_time
+            
+            # Show info about cached results
+            st.info(f"📋 Showing cached results from {int(time_ago/60)} minute(s) ago. Click 'Process' to refresh.")
     
     if process_clicked and selected_template:
         st.markdown("### Processing Results")
@@ -519,7 +547,26 @@ def run() -> None:
                 unstructured=unstructured,
             )
         
+        # Store result in session state for persistence
+        st.session_state['last_result'] = result
+        st.session_state['last_template_name'] = selected_template_name
+        st.session_state['last_images'] = selected.copy()
+        st.session_state['processing_timestamp'] = time.time()
+        st.session_state['last_unstructured'] = unstructured
+        show_cached = False
+        
         # Display results
+    
+    # Display results (either new or cached)
+    if (process_clicked or show_cached) and 'last_result' in st.session_state:
+        result = st.session_state['last_result']
+        
+        # Show results header
+        if not process_clicked and show_cached:
+            st.markdown("### 📋 Cached Processing Results")
+        elif process_clicked:
+            st.markdown("### ✅ New Processing Results")
+        
         if result.get("error"):
             # User-friendly error message
             error_raw = str(result.get("error", ""))
@@ -590,11 +637,21 @@ def run() -> None:
                     st.write("• Switching to a faster model")
                 
             # Show debug info
-            with st.expander("Debug Information"):
+            with st.expander("Debug Information", expanded=False):
                 st.write("**Full error details:**")
-                st.json(result)
-                if result.get("status"):
-                    st.write(f"**HTTP Status:** {result['status']}")
+                # Store debug info in session state for persistence
+                if process_clicked:
+                    st.session_state['last_debug_info'] = {
+                        'result': result,
+                        'status': result.get("status"),
+                        'timestamp': time.time()
+                    }
+                
+                # Display debug info from current or cached
+                debug_info = st.session_state.get('last_debug_info', {'result': result, 'status': result.get("status")})
+                st.json(debug_info['result'])
+                if debug_info.get('status'):
+                    st.write(f"**HTTP Status:** {debug_info['status']}")
         else:
             st.success(f"✅ Processing complete in {result['elapsed_s']:.2f}s")
             
@@ -603,16 +660,37 @@ def run() -> None:
 
             output = result.get("output")
             if output is not None:
-                if unstructured and isinstance(output, dict) and "raw_text" in output:
+                # Check if this is unstructured mode (either current or cached)
+                is_unstructured = unstructured if process_clicked else st.session_state.get('last_unstructured', False)
+                
+                if is_unstructured and isinstance(output, dict) and "raw_text" in output:
                     md_text = output.get("raw_text") or ""
                     st.markdown(md_text)
 
                     # Prepare exports (treat raw_text as a single-row dataset for JSON/XLSX)
                     recs = ensure_records(output)
                     cols = all_columns(recs)
-                    md_bytes = (md_text or "").encode("utf-8")
-                    json_bytes = to_json_bytes(recs)
-                    xlsx_bytes = to_xlsx_bytes(recs, cols)
+                    
+                    # Check if we have cached export data
+                    if not process_clicked and 'export_data' in st.session_state:
+                        # Use cached export data
+                        export_data = st.session_state['export_data']
+                        md_bytes = export_data.get('markdown', (md_text or "").encode("utf-8"))
+                        json_bytes = export_data.get('json', to_json_bytes(recs))
+                        xlsx_bytes = export_data.get('excel', to_xlsx_bytes(recs, cols))
+                    else:
+                        # Generate new export data
+                        md_bytes = (md_text or "").encode("utf-8")
+                        json_bytes = to_json_bytes(recs)
+                        xlsx_bytes = to_xlsx_bytes(recs, cols)
+                        
+                        # Cache export data
+                        st.session_state['export_data'] = {
+                            'markdown': md_bytes,
+                            'json': json_bytes,
+                            'excel': xlsx_bytes,
+                            'timestamp': time.time()
+                        }
 
                     # Export options
                     st.markdown("#### Export")
@@ -645,9 +723,27 @@ def run() -> None:
                     # Normalize and export in three formats
                     recs = ensure_records(output)
                     cols = all_columns(recs)
-                    json_bytes = to_json_bytes(recs)
-                    md_bytes = to_markdown_bytes(recs, cols)
-                    xlsx_bytes = to_xlsx_bytes(recs, cols)
+                    
+                    # Check if we have cached export data
+                    if not process_clicked and 'export_data' in st.session_state:
+                        # Use cached export data
+                        export_data = st.session_state['export_data']
+                        json_bytes = export_data.get('json', to_json_bytes(recs))
+                        md_bytes = export_data.get('markdown', to_markdown_bytes(recs, cols))
+                        xlsx_bytes = export_data.get('excel', to_xlsx_bytes(recs, cols))
+                    else:
+                        # Generate new export data
+                        json_bytes = to_json_bytes(recs)
+                        md_bytes = to_markdown_bytes(recs, cols)
+                        xlsx_bytes = to_xlsx_bytes(recs, cols)
+                        
+                        # Cache export data
+                        st.session_state['export_data'] = {
+                            'json': json_bytes,
+                            'markdown': md_bytes,
+                            'excel': xlsx_bytes,
+                            'timestamp': time.time()
+                        }
 
                     st.markdown("#### Export")
                     col1, col2, col3 = st.columns(3)
@@ -686,11 +782,27 @@ def run() -> None:
             # Show usage/cost if available
             if result.get("usage"):
                 usage = result["usage"]
+                
+                # Store usage info in session state
+                if process_clicked:
+                    st.session_state['last_usage'] = {
+                        'usage': usage,
+                        'provider_info': {
+                            'model_id': provider.model_id,
+                            'max_output_tokens': provider.default_max_output_tokens,
+                            'catalog_caps_json': provider.catalog_caps_json
+                        }
+                    }
+                
+                # Get usage from current or cached
+                usage_info = st.session_state.get('last_usage', {'usage': usage})
+                usage_data = usage_info['usage']
+                
                 with st.expander("Usage Details"):
-                    st.write(f"**Input tokens:** {usage.get('prompt_tokens', 0):,}")
-                    output_tokens = usage.get('completion_tokens', 0)
+                    st.write(f"**Input tokens:** {usage_data.get('prompt_tokens', 0):,}")
+                    output_tokens = usage_data.get('completion_tokens', 0)
                     st.write(f"**Output tokens:** {output_tokens:,}")
-                    st.write(f"**Total tokens:** {usage.get('total_tokens', 0):,}")
+                    st.write(f"**Total tokens:** {usage_data.get('total_tokens', 0):,}")
                     
                     # Warning if output seems truncated
                     max_requested = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
@@ -700,9 +812,19 @@ def run() -> None:
                     # Calculate cost if pricing available
                     if provider.catalog_caps_json:
                         from app.core.cost import cost_from_usage
-                        cost_info = cost_from_usage(usage, provider.catalog_caps_json)
+                        cost_info = cost_from_usage(usage_data, provider.catalog_caps_json)
                         if cost_info and cost_info.get("total", 0) > 0:
                             st.write(f"**Estimated cost:** ${cost_info['total']:.4f}")
+                            
+                            # Track cumulative cost in session
+                            if process_clicked:
+                                if 'cumulative_cost' not in st.session_state:
+                                    st.session_state['cumulative_cost'] = 0.0
+                                st.session_state['cumulative_cost'] += cost_info['total']
+                            
+                            # Show cumulative cost if multiple runs
+                            if 'cumulative_cost' in st.session_state:
+                                st.caption(f"Session total: ${st.session_state['cumulative_cost']:.4f}")
             
             # Store run in database
             if result.get("output"):
