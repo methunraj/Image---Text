@@ -41,6 +41,34 @@ def _sanitize_filename(name: str) -> str:
     return name or "image"
 
 
+def _guess_original_stem(path: Path) -> str:
+    """Return the original file stem, stripping our upload hash prefix when present.
+
+    Uploaded files are stored as '<hash12>_<original>'. For other files, use stem as-is.
+    """
+    try:
+        if path.parent.resolve() == UPLOAD_DIR.resolve():
+            parts = path.name.split("_", 1)
+            if len(parts) == 2 and len(parts[0]) == 12 and all(c in "0123456789abcdef" for c in parts[0].lower()):
+                return Path(parts[1]).stem
+    except Exception:
+        pass
+    return path.stem
+
+
+def _find_images_in_folder(folder: Path, recursive: bool = True) -> List[str]:
+    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    results: List[str] = []
+    try:
+        it = folder.rglob("*") if recursive else folder.glob("*")
+        for p in it:
+            if p.is_file() and p.suffix.lower() in exts:
+                results.append(str(p))
+    except Exception:
+        return []
+    return sorted(results)
+
+
 def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
     """Save uploaded files with validation and size limits."""
     MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB limit
@@ -344,24 +372,75 @@ def run() -> None:
         if st.button("Go to Settings"):
             st.switch_page("pages/2_Settings.py")
     
-    # Upload Section
-    st.markdown("## 1️⃣ Upload Images")
-    
-    uploaded = st.file_uploader(
-        "Select images to upload",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-        help="Maximum 10MB per file"
+    # Upload or Folder Section
+    st.markdown("## 1️⃣ Add Input Files")
+
+    src_choice = st.radio(
+        "Source",
+        options=["Upload files", "Select folder"],
+        horizontal=True,
+        help="Upload individual images or add an entire folder"
     )
-    
-    if uploaded:
-        saved_paths = _save_uploaded_files(uploaded)
-        lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-        for pth in saved_paths:
-            if pth not in lst:
-                lst.append(pth)
-        if saved_paths:
-            st.success(f"✅ Uploaded {len(saved_paths)} file(s)")
+
+    if src_choice == "Upload files":
+        uploaded = st.file_uploader(
+            "Select images to upload",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            help="Maximum 10MB per file"
+        )
+        
+        if uploaded:
+            saved_paths = _save_uploaded_files(uploaded)
+            lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+            for pth in saved_paths:
+                if pth not in lst:
+                    lst.append(pth)
+            if saved_paths:
+                st.success(f"✅ Uploaded {len(saved_paths)} file(s)")
+    else:
+        col_f1, col_f2 = st.columns([3, 1])
+        with col_f1:
+            default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
+            folder_path = st.text_input(
+                "Folder path",
+                value=st.session_state.get("last_folder_path", default_dir),
+                placeholder="/path/to/folder",
+                help="Enter a local folder path"
+            )
+        with col_f2:
+            recursive = st.checkbox("Include subfolders", value=True)
+        folder_ok = False
+        if folder_path:
+            fp = Path(folder_path).expanduser()
+            folder_ok = fp.exists() and fp.is_dir()
+        col_b1, col_b2, _ = st.columns([1, 1, 4])
+        with col_b1:
+            add_all = st.button("Add Folder")
+        with col_b2:
+            preview = st.button("Preview")
+        if preview and folder_ok:
+            imgs_found = _find_images_in_folder(Path(folder_path).expanduser(), recursive)
+            if imgs_found:
+                st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
+            else:
+                st.warning("No images found in this folder.")
+        if add_all:
+            if not folder_ok:
+                st.error("Folder does not exist or is not accessible.")
+            else:
+                st.session_state["last_folder_path"] = folder_path
+                imgs_found = _find_images_in_folder(Path(folder_path).expanduser(), recursive)
+                if not imgs_found:
+                    st.warning("No images found in this folder.")
+                else:
+                    lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                    added = 0
+                    for p in imgs_found:
+                        if p not in lst:
+                            lst.append(p)
+                            added += 1
+                    st.success(f"✅ Added {added} image(s) from folder")
     
     # Image Management (Simple List)
     imgs: List[str] = st.session_state.get("uploaded_images", [])
@@ -370,7 +449,7 @@ def run() -> None:
         st.info("No images uploaded yet. Upload some images to get started.")
         return
     
-    st.markdown(f"### Uploaded Files ({len(imgs)})")
+    st.markdown(f"### Input Files ({len(imgs)})")
     
     # Simple list view without previews
     selected: List[str] = st.session_state.setdefault("selected_images", [])
@@ -397,7 +476,8 @@ def run() -> None:
             col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
             
             with col1:
-                checked = st.checkbox("", value=(pth in selected), key=f"sel_{idx}")
+                stable_key = f"sel_{hashlib.sha1(pth.encode('utf-8')).hexdigest()[:10]}"
+                checked = st.checkbox("", value=(pth in selected), key=stable_key)
                 if checked and pth not in selected:
                     selected.append(pth)
                 elif not checked and pth in selected:
@@ -491,17 +571,19 @@ def run() -> None:
         st.write(f"**API Endpoint:** {provider.base_url}")
     
     # Output mode toggle and Process button
-    col1, col2, col3 = st.columns([1, 4, 1])
+    col1, col2, col3, col4 = st.columns([1.2, 1.4, 3.4, 1])
     with col1:
         # Minimal, per-run toggle to avoid DB/schema changes
-        unstructured = st.checkbox("Unstructured (Markdown)", help="Skip schema; return plain text/Markdown.")
+        unstructured = st.checkbox("Unstructured", help="Skip schema; return plain text/Markdown.")
     with col2:
+        per_file_mode = st.checkbox("Per-file save", help="Process each file separately and auto-save next to inputs")
+    with col3:
         process_clicked = st.button(
             f"▶️ Process {len(selected)} Image(s)",
             type="primary",
             use_container_width=True
         )
-    with col3:
+    with col4:
         # Clear results button
         if 'last_result' in st.session_state:
             if st.button("🗑️ Clear", help="Clear cached results"):
@@ -516,7 +598,7 @@ def run() -> None:
     
     # Check for cached results first
     show_cached = False
-    if 'last_result' in st.session_state and not process_clicked:
+    if 'last_result' in st.session_state and not process_clicked and not st.session_state.get('per_file_mode_active', False):
         # Check if the cached result is for the same template and images
         cached_template = st.session_state.get('last_template_name', '')
         cached_images = st.session_state.get('last_images', [])
@@ -530,6 +612,66 @@ def run() -> None:
             # Show info about cached results
             st.info(f"📋 Showing cached results from {int(time_ago/60)} minute(s) ago. Click 'Process' to refresh.")
     
+    # Per-file mode: run one-by-one and save
+    if process_clicked and selected_template and per_file_mode:
+        st.markdown("### Processing & Saving Per File")
+        from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes
+        from scripts.export_records import to_docx_bytes, to_docx_from_text_bytes
+        total = len(selected)
+        progress = st.progress(0.0, text=f"Processing 0/{total}")
+        saved_counts = {"json": 0, "md": 0, "docx": 0}
+        errors: List[str] = []
+        st.session_state['per_file_mode_active'] = True
+        for idx, img_path in enumerate(selected, start=1):
+            try:
+                result = _process_images(
+                    provider,
+                    api_key or "",
+                    selected_template,
+                    [img_path],
+                    tags,
+                    unstructured=unstructured,
+                )
+                out = result.get("output")
+                in_path = Path(img_path)
+                out_dir = in_path.parent
+                base_name = _guess_original_stem(in_path)
+                if not out:
+                    errors.append(f"No output for {in_path.name}")
+                else:
+                    if unstructured and isinstance(out, dict) and 'raw_text' in out:
+                        text = str(out.get('raw_text') or "")
+                        (out_dir / f"{base_name}.md").write_bytes((text or "").encode("utf-8"))
+                        docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                        (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                        recs = ensure_records({"raw_text": text})
+                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                        saved_counts['md'] += 1
+                        saved_counts['docx'] += 1
+                        saved_counts['json'] += 1
+                    else:
+                        recs = ensure_records(out)
+                        cols = all_columns(recs)
+                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                        (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
+                        (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
+                        saved_counts['json'] += 1
+                        saved_counts['md'] += 1
+                        saved_counts['docx'] += 1
+            except Exception as e:
+                errors.append(f"Save failed for {Path(img_path).name}: {e}")
+            finally:
+                progress.progress(idx/total, text=f"Processing {idx}/{total}")
+        progress.empty()
+        st.success(f"Saved: {saved_counts['json']} JSON, {saved_counts['md']} MD, {saved_counts['docx']} DOCX next to inputs")
+        if errors:
+            with st.expander("Errors encountered"):
+                for e in errors:
+                    st.error(e)
+        # End per-file mode early to avoid aggregated rendering
+        st.session_state['per_file_mode_active'] = False
+        return
+
     if process_clicked and selected_template:
         st.markdown("### Processing Results")
         
@@ -623,7 +765,7 @@ def run() -> None:
                 is_local_error_check = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
                 if is_local_error_check:
                     st.write("Local models can be slow. Try:")
-                    st.write("• Increasing the timeout in Settings (current: " + str(provider.timeout_s or default_timeout) + "s)")
+                    st.write("• Increasing the timeout in Settings (current: " + str(int(provider.timeout_s or 120)) + "s)")
                     st.write("• Using a smaller model")
                     st.write("• Reducing max_output_tokens")
                     st.write("• Processing one image at a time")
@@ -678,23 +820,27 @@ def run() -> None:
                         md_bytes = export_data.get('markdown', (md_text or "").encode("utf-8"))
                         json_bytes = export_data.get('json', to_json_bytes(recs))
                         xlsx_bytes = export_data.get('excel', to_xlsx_bytes(recs, cols))
+                        docx_bytes = export_data.get('docx', None)
                     else:
                         # Generate new export data
                         md_bytes = (md_text or "").encode("utf-8")
                         json_bytes = to_json_bytes(recs)
                         xlsx_bytes = to_xlsx_bytes(recs, cols)
+                        from scripts.export_records import to_docx_from_text_bytes
+                        docx_bytes = to_docx_from_text_bytes(md_text, title="Extraction")
                         
                         # Cache export data
                         st.session_state['export_data'] = {
                             'markdown': md_bytes,
                             'json': json_bytes,
                             'excel': xlsx_bytes,
+                            'docx': docx_bytes,
                             'timestamp': time.time()
                         }
 
                     # Export options
                     st.markdown("#### Export")
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.download_button(
                             "📥 Markdown (.md)",
@@ -716,6 +862,14 @@ def run() -> None:
                             file_name=f"extraction_{int(time.time())}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
+                    with col4:
+                        if docx_bytes is not None:
+                            st.download_button(
+                                "📥 Word (.docx)",
+                                data=docx_bytes,
+                                file_name=f"extraction_{int(time.time())}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
                 else:
                     # Structured JSON (existing behavior)
                     st.json(output)
@@ -731,22 +885,26 @@ def run() -> None:
                         json_bytes = export_data.get('json', to_json_bytes(recs))
                         md_bytes = export_data.get('markdown', to_markdown_bytes(recs, cols))
                         xlsx_bytes = export_data.get('excel', to_xlsx_bytes(recs, cols))
+                        docx_bytes = export_data.get('docx', None)
                     else:
                         # Generate new export data
                         json_bytes = to_json_bytes(recs)
                         md_bytes = to_markdown_bytes(recs, cols)
                         xlsx_bytes = to_xlsx_bytes(recs, cols)
+                        from scripts.export_records import to_docx_bytes
+                        docx_bytes = to_docx_bytes(recs, cols)
                         
                         # Cache export data
                         st.session_state['export_data'] = {
                             'json': json_bytes,
                             'markdown': md_bytes,
                             'excel': xlsx_bytes,
+                            'docx': docx_bytes,
                             'timestamp': time.time()
                         }
 
                     st.markdown("#### Export")
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.download_button(
                             "📥 JSON (.json)",
@@ -768,6 +926,14 @@ def run() -> None:
                             file_name=f"extraction_{int(time.time())}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         )
+                    with col4:
+                        if docx_bytes is not None:
+                            st.download_button(
+                                "📥 Word (.docx)",
+                                data=docx_bytes,
+                                file_name=f"extraction_{int(time.time())}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
             else:
                 st.warning("⚠️ No output received from the model. This could mean:")
                 st.write("- The model returned an empty response")

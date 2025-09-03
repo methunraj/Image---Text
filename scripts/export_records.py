@@ -76,6 +76,48 @@ def to_xlsx_bytes(records: List[Dict[str, Any]], cols: List[str]) -> bytes:
     return buf.getvalue()
 
 
+def to_docx_bytes(records: List[Dict[str, Any]], cols: List[str]) -> bytes:
+    """Create a simple DOCX table for records.
+
+    - First row as headers
+    - One row per record; non-primitive values are JSON-encoded
+    """
+    from docx import Document  # requires python-docx
+
+    doc = Document()
+    doc.add_heading("Export", level=1)
+
+    # Create table with header
+    table = doc.add_table(rows=1, cols=len(cols))
+    hdr_cells = table.rows[0].cells
+    for i, c in enumerate(cols):
+        hdr_cells[i].text = str(c)
+
+    for r in records:
+        row_cells = table.add_row().cells
+        for i, c in enumerate(cols):
+            row_cells[i].text = str(_norm_cell(r.get(c, "")))
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def to_docx_from_text_bytes(text: str, title: str | None = None) -> bytes:
+    """Create a DOCX document from plain text (best-effort for Markdown)."""
+    from docx import Document
+
+    doc = Document()
+    if title:
+        doc.add_heading(title, level=1)
+    # Keep simple: one paragraph block; avoid complex markdown parsing
+    for line in str(text or "").splitlines():
+        doc.add_paragraph(line)
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 def _cli() -> None:
     import argparse
 
@@ -96,4 +138,3 @@ def _cli() -> None:
 
 if __name__ == "__main__":
     _cli()
-
