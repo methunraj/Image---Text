@@ -33,10 +33,20 @@ def _encode_image_to_data_url_uncached(path: str) -> str:
     """Internal uncached image encoding."""
     mime = "image/png"
     lower = path.lower()
-    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+    if lower.endswith((".jpg", ".jpeg", ".jfif")):
         mime = "image/jpeg"
     elif lower.endswith(".webp"):
         mime = "image/webp"
+    elif lower.endswith(".gif"):
+        mime = "image/gif"
+    elif lower.endswith(".bmp"):
+        mime = "image/bmp"
+    elif lower.endswith((".tif", ".tiff")):
+        mime = "image/tiff"
+    elif lower.endswith(".heic"):
+        mime = "image/heic"
+    elif lower.endswith(".heif"):
+        mime = "image/heif"
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -78,10 +88,20 @@ def _encode_image_to_b64_uncached(path: str) -> Tuple[str, str]:
     """Internal uncached b64 encoding."""
     mime = "image/png"
     lower = path.lower()
-    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+    if lower.endswith((".jpg", ".jpeg", ".jfif")):
         mime = "image/jpeg"
     elif lower.endswith(".webp"):
         mime = "image/webp"
+    elif lower.endswith(".gif"):
+        mime = "image/gif"
+    elif lower.endswith(".bmp"):
+        mime = "image/bmp"
+    elif lower.endswith((".tif", ".tiff")):
+        mime = "image/tiff"
+    elif lower.endswith(".heic"):
+        mime = "image/heic"
+    elif lower.endswith(".heif"):
+        mime = "image/heif"
     try:
         with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")

@@ -57,7 +57,12 @@ def _guess_original_stem(path: Path) -> str:
 
 
 def _find_images_in_folder(folder: Path, recursive: bool = True) -> List[str]:
-    exts = {".png", ".jpg", ".jpeg", ".webp"}
+    # Support a broader set of common image extensions
+    exts = {
+        ".png", ".jpg", ".jpeg", ".webp",
+        ".bmp", ".gif", ".tif", ".tiff",
+        ".heic", ".heif", ".jfif",
+    }
     results: List[str] = []
     try:
         it = folder.rglob("*") if recursive else folder.glob("*")
@@ -67,6 +72,29 @@ def _find_images_in_folder(folder: Path, recursive: bool = True) -> List[str]:
     except Exception:
         return []
     return sorted(results)
+
+
+def _normalize_folder_input(raw: str) -> str:
+    """Normalize a folder path string from user input.
+
+    - Strips whitespace and surrounding quotes
+    - Handles file:// URLs by converting to local paths
+    - Expands ~ to home
+    """
+    s = (raw or "").strip()
+    if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+        s = s[1:-1].strip()
+    # Convert file:// URLs (simple heuristic)
+    if s.lower().startswith("file://"):
+        # On macOS/Linux, file:///Users/name/… → /Users/name/…
+        # On Windows, file:///C:/path → C:/path
+        s = s[7:]
+        # Remove leading slash for Windows drive letters like /C:/...
+        if len(s) >= 3 and s[0] == "/" and s[2] == ":":
+            s = s[1:]
+    # Expand ~ and environment vars
+    s = os.path.expandvars(os.path.expanduser(s))
+    return s
 
 
 def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
@@ -412,27 +440,30 @@ def run() -> None:
             recursive = st.checkbox("Include subfolders", value=True)
         folder_ok = False
         if folder_path:
-            fp = Path(folder_path).expanduser()
+            normalized = _normalize_folder_input(folder_path)
+            fp = Path(normalized)
             folder_ok = fp.exists() and fp.is_dir()
+            # Small hint for users to see how input was interpreted
+            st.caption(f"Resolved path: {str(fp)}")
         col_b1, col_b2, _ = st.columns([1, 1, 4])
         with col_b1:
             add_all = st.button("Add Folder")
         with col_b2:
             preview = st.button("Preview")
         if preview and folder_ok:
-            imgs_found = _find_images_in_folder(Path(folder_path).expanduser(), recursive)
+            imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
             if imgs_found:
                 st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
             else:
-                st.warning("No images found in this folder.")
+                st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
         if add_all:
             if not folder_ok:
                 st.error("Folder does not exist or is not accessible.")
             else:
                 st.session_state["last_folder_path"] = folder_path
-                imgs_found = _find_images_in_folder(Path(folder_path).expanduser(), recursive)
+                imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
                 if not imgs_found:
-                    st.warning("No images found in this folder.")
+                    st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
                 else:
                     lst: List[str] = st.session_state.setdefault("uploaded_images", [])
                     added = 0
