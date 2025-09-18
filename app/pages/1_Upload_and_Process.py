@@ -646,7 +646,6 @@ def run() -> None:
     # Per-file mode: run one-by-one and save
     if process_clicked and selected_template and per_file_mode:
         st.markdown("### Processing & Saving Per File")
-        from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes
         from scripts.export_records import to_docx_bytes, to_docx_from_text_bytes
         total = len(selected)
         progress = st.progress(0.0, text=f"Processing 0/{total}")

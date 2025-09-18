@@ -1607,8 +1607,13 @@ Respond ONLY with JSON."""
         del_clicked = st.button("Delete", use_container_width=True, disabled=is_new)
 
     if save_clicked:
+        normalized_name = name.strip()
+        if not normalized_name:
+            st.error("Template name cannot be empty")
+            return
+
         body = {
-            "name": name.strip(),
+            "name": normalized_name,
             "description": desc or None,
             "system_prompt": system_prompt or None,
             "user_prompt": user_prompt or None,
@@ -1618,25 +1623,48 @@ Respond ONLY with JSON."""
         }
         yaml_blob = yaml.safe_dump(body, sort_keys=False)
         if is_new:
-            tnew = storage.create_template(
-                name.strip(), content="", schema_json=schema_obj, examples_json=[asdict(e) for e in examples]
-            )
-            tnew = storage.update_template(
-                tnew.id,
-                description=desc or None,
-                system_prompt=system_prompt or None,
-                user_prompt=user_prompt or None,
-                yaml_blob=yaml_blob,
-            )
-            st.success("✅ Template created successfully!")
-            # Save the success state and template name to session
-            st.session_state.template_saved = True
-            st.session_state.saved_template_name = name.strip()
-            st.rerun()
+            existing_tpl = storage.get_template_by_name(normalized_name)
+            if existing_tpl:
+                storage.update_template(
+                    existing_tpl.id,
+                    name=normalized_name,
+                    description=desc or None,
+                    system_prompt=system_prompt or None,
+                    user_prompt=user_prompt or None,
+                    schema_json=schema_obj,
+                    examples_json=[asdict(e) for e in examples],
+                    yaml_blob=yaml_blob,
+                    version_tag=existing_tpl.version_tag,
+                )
+                st.success("✅ Existing template overwritten with latest changes.")
+                st.session_state.template_saved = True
+                st.session_state.saved_template_name = normalized_name
+                st.rerun()
+            else:
+                try:
+                    tnew = storage.create_template(
+                        normalized_name,
+                        content="",
+                        schema_json=schema_obj,
+                        examples_json=[asdict(e) for e in examples],
+                    )
+                    storage.update_template(
+                        tnew.id,
+                        description=desc or None,
+                        system_prompt=system_prompt or None,
+                        user_prompt=user_prompt or None,
+                        yaml_blob=yaml_blob,
+                    )
+                    st.success("✅ Template created successfully!")
+                    st.session_state.template_saved = True
+                    st.session_state.saved_template_name = normalized_name
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not save template: {exc}")
         else:
             storage.update_template(
                 tpl.id,
-                name=name.strip(),
+                name=normalized_name,
                 description=desc or None,
                 system_prompt=system_prompt or None,
                 user_prompt=user_prompt or None,
@@ -1647,7 +1675,7 @@ Respond ONLY with JSON."""
             st.success("✅ Template saved successfully!")
             # Save the success state and template name to session
             st.session_state.template_saved = True
-            st.session_state.saved_template_name = name.strip()
+            st.session_state.saved_template_name = normalized_name
             st.rerun()
 
     if clone_clicked and tpl:
