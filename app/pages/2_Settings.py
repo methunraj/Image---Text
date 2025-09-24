@@ -22,7 +22,8 @@ if str(_ROOT) not in sys.path:
 
 from app.core import ui as core_ui
 from app.core import storage
-from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path
+from app.core.model_registry import ModelRegistryError, active_model, config_metadata, ensure_registry, reload_registry
+from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path, cache_provider_logo
 from app.core.provider_endpoints import get_provider_base_urls
 from app.core.local_models import is_local_provider, list_local_providers, discover_provider_models
 from app.core.provider_openai import OpenAIProvider, OAIGateway, tiny_png_data_url
@@ -1701,238 +1702,104 @@ Respond ONLY with JSON."""
         st.rerun()
 
 
-def run() -> None:
-    load_dotenv(override=False)
-    st.title("Settings")
-    storage.init_db()
-    
-    # Get active provider for sidebar
-    active = storage.get_active_provider()
-    
-    with st.sidebar:
-        prof_name = active.name if active else "None"
-        logo = active.logo_path if active else None
-        core_ui.status_chip("Active Profile", prof_name, logo_path=logo)
-    
-    # Main tabs: Model and Template
-    tab_model, tab_template = st.tabs(["🤖 Model", "📝 Template"])
-    
-    with tab_model:
-        st.markdown("### Configure AI Model")
-        st.caption("Select and configure the model for image-to-JSON extraction")
-        
-        # Profile Management Section
-        providers = storage.list_providers()
-        if providers:
-            st.markdown("#### 📂 Saved Profiles")
-            col1, col2, col3 = st.columns([3, 1, 1])
-            
-            with col1:
-                profile_names = ["Select a saved profile..."] + [p.name for p in providers]
-                selected_profile_name = st.selectbox(
-                    "Load Profile",
-                    options=profile_names,
-                    index=0,
-                    help="Select a previously saved profile to load its settings"
-                )
-            
-            with col2:
-                if selected_profile_name != "Select a saved profile...":
-                    if st.button("✅ Set Active", use_container_width=True):
-                        selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                        if selected_provider:
-                            storage.set_active_provider(selected_provider.id)
-                            # Hydrate session with the stored API key (encrypted or session) for seamless usage
-                            try:
-                                key = _get_api_key_for_provider(
-                                    selected_provider.id,
-                                    selected_provider.key_storage,
-                                    selected_provider.api_key_enc,
-                                )
-                                if key:
-                                    keys: Dict[int, str] = st.session_state.setdefault("_api_keys", {})
-                                    keys[selected_provider.id] = key
-                            except Exception:
-                                pass
-                            st.success(f"'{selected_profile_name}' is now active!")
-                            st.rerun()
-            
-            with col3:
-                if selected_profile_name != "Select a saved profile...":
-                    if st.button("🗑️ Delete", use_container_width=True):
-                        selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                        if selected_provider:
-                            storage.delete_provider(selected_provider.id)
-                            st.warning(f"Deleted profile: {selected_profile_name}")
-                            st.rerun()
-            
-            if selected_profile_name != "Select a saved profile...":
-                # Load the selected profile
-                selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                if selected_provider:
-                    st.session_state["selected_profile"] = selected_profile_name
-                    # Display loaded profile configuration
-                    st.success(f"✅ Loaded profile: {selected_profile_name}")
-                    st.divider()
-                    st.markdown("### Loaded Profile Configuration")
-                    _model_configuration({
-                        "model_id": selected_provider.model_id,
-                        "provider_name": selected_provider.name,
-                        "is_loaded_profile": True
-                    })
-            else:
-                st.divider()
-                st.markdown("#### 🆕 Or Configure New Model")
-                
-                # Model selection sub-tabs - only show when no profile selected
-                tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-                
-                selected_model_info = None
-                
-                with tab_catalog:
-                    catalog = get_cached_catalog()
-                    if catalog:
-                        selected_model_info = _model_browser(catalog)
-                        if selected_model_info:
-                            st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                            st.session_state["selected_model"] = selected_model_info
-                    else:
-                        st.error("Could not load models catalog")
-                
-                with tab_custom:
-                    # Check if custom model was already selected
-                    if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                        selected_model_info = st.session_state["selected_model"]
-                        st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-                    
-                    custom_info = _custom_model_form()
-                    if custom_info:
-                        selected_model_info = custom_info
-                        st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                        st.session_state["selected_model"] = selected_model_info
-                
-                # Use session state to persist selection
-                if not selected_model_info and "selected_model" in st.session_state:
-                    selected_model_info = st.session_state["selected_model"]
-                
-                if selected_model_info:
-                    st.divider()
-                    st.markdown("### Connection Configuration")
-                    _model_configuration(selected_model_info)
-                else:
-                    st.info("👆 Select a model from the catalog or add a custom model to configure connection settings")
-        else:
-            # No saved profiles - show new model configuration
-            st.markdown("#### Configure New Model")
-            
-            # Model selection sub-tabs
-            tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-            
-            selected_model_info = None
-            
-            with tab_catalog:
-                catalog = get_cached_catalog()
-                if catalog:
-                    selected_model_info = _model_browser(catalog)
-                    if selected_model_info:
-                        st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                        st.session_state["selected_model"] = selected_model_info
-                else:
-                    st.error("Could not load models catalog")
-            
-            with tab_custom:
-                # Check if custom model was already selected
-                if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                    selected_model_info = st.session_state["selected_model"]
-                    st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-                
-                custom_info = _custom_model_form()
-                if custom_info:
-                    selected_model_info = custom_info
-                    st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                    st.session_state["selected_model"] = selected_model_info
-            
-            # Use session state to persist selection
-            if not selected_model_info and "selected_model" in st.session_state:
-                selected_model_info = st.session_state["selected_model"]
-            
-            if selected_model_info:
-                st.divider()
-                st.markdown("### Connection Configuration")
-                _model_configuration(selected_model_info)
-            else:
-                st.info("👆 Select a model from the catalog or add a custom model to configure connection settings")
-    
-    with tab_template:
-        st.markdown("### Manage Templates")
-        st.caption("Create and manage prompt templates for consistent extraction")
-        _template_management()
-
-
-# Override old run() with streamlined workflow
+# Override old run() with registry-driven workflow
 def run() -> None:  # type: ignore[no-redef]
     load_dotenv(override=False)
     st.title("Settings")
     storage.init_db()
 
-    # Sidebar: show active model
-    active = storage.get_active_provider()
-    with st.sidebar:
-        prof_name = (active.model_id or active.name) if active else "None"
-        logo = active.logo_path if active else None
-        core_ui.status_chip("Active Model", prof_name, logo_path=logo)
+    registry_error: str | None = None
+    registry = None
+    try:
+        registry = ensure_registry()
+    except Exception as exc:
+        registry_error = str(exc)
 
-    # Tabs
-    tab_model, tab_template = st.tabs(["🤖 Model", "📝 Template"])
+    with st.sidebar:
+        try:
+            descriptor = active_model()
+            logo = cache_provider_logo(descriptor.provider_id)
+            core_ui.status_chip("Active Model", descriptor.label, logo_path=logo)
+        except ModelRegistryError:
+            core_ui.status_chip("Active Model", "Unavailable")
+
+    tab_model, tab_template = st.tabs(["🤖 Models", "📝 Templates"])
 
     with tab_model:
-        st.markdown("### Configure AI Model")
-        st.caption("Pick a provider/model; if a key is missing you can add it inline.")
+        st.markdown("### Model Registry")
 
-        catalog = get_cached_catalog()
-        st.markdown("#### Select Model")
-        tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-
-        selected_model_info = None
-        with tab_catalog:
-            if catalog:
-                selected_model_info = _grouped_model_selector(catalog)
-                if selected_model_info:
-                    st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                    st.session_state["selected_model"] = selected_model_info
-            else:
-                st.error("Could not load models catalog")
-
-        with tab_custom:
-            # Check if custom model was already selected
-            if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                selected_model_info = st.session_state["selected_model"]
-                st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-            
-            custom_info = _custom_model_form()
-            if custom_info:
-                selected_model_info = custom_info
-                st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                st.session_state["selected_model"] = selected_model_info
-
-        if not selected_model_info and "selected_model" in st.session_state:
-            # Rehydrate previous selection from session, but only if the provider key exists
-            maybe_saved = st.session_state["selected_model"]
-            pid = (maybe_saved or {}).get("provider_id")
-            if pid and _get_api_key_for_provider_code(pid):
-                selected_model_info = maybe_saved
-            else:
-                # Drop stale selection without key
-                selected_model_info = None
-
-        if selected_model_info:
-            st.divider()
-            st.markdown("### Connection Configuration")
-            _streamlined_model_configuration(selected_model_info)
+        if registry_error:
+            st.error(f"Failed to load registry: {registry_error}")
         else:
-            st.info("👆 Select a provider and model, or add a custom model")
+            metadata = config_metadata()
+            profile = metadata.get("profile", "dev") if metadata else "dev"
+            source_path = metadata.get("source_path") if metadata else "(unknown)"
+            st.caption(f"Profile: `{profile}` • Source: `{source_path}`")
 
-        # Advanced key management removed from default flow to avoid duplicate key entry points
+            reload_clicked = st.button("Reload config", type="primary")
+            if reload_clicked:
+                try:
+                    registry = reload_registry()
+                    st.success("Configuration reloaded successfully")
+                except Exception as exc:  # pragma: no cover
+                    st.error(f"Reload failed: {exc}")
+
+            if registry:
+                try:
+                    default_model = registry.resolve(None)
+                    st.write(f"**Default model:** {default_model.label} ({default_model.provider_label})")
+                    st.write(f"**Route:** {default_model.route}")
+                except ModelRegistryError:
+                    st.warning("No default model configured")
+
+                capabilities_rows: List[Dict[str, Any]] = []
+                for model in sorted(registry.models.values(), key=lambda m: (m.provider_label, m.label)):
+                    if not model.show_in_ui:
+                        continue
+                    caps = model.capabilities
+                    pricing = model.pricing
+                    reasoning = model.reasoning
+                    reasoning_label = "—"
+                    if reasoning and reasoning.provider and reasoning.provider != "none":
+                        parts = [reasoning.provider]
+                        if reasoning.effort_default:
+                            parts.append(str(reasoning.effort_default))
+                        reasoning_label = ", ".join(parts)
+                    capabilities_rows.append(
+                        {
+                            "Provider": model.provider_label,
+                            "Model": model.label,
+                            "Route": model.route,
+                            "Vision": "✅" if caps.vision else "—",
+                            "Tools": "✅" if caps.tools else "—",
+                            "JSON": "✅" if caps.json_mode or caps.structured_output else "—",
+                            "Streaming": "✅" if caps.streaming else "—",
+                            "Context": f"{model.context_window:,}",
+                            "Max Output": model.max_output_tokens or "∞",
+                            "Input $/1K": f"{pricing.input_per_1k:.4f}" if pricing.input_per_1k or pricing.input_per_1k == 0 else "—",
+                            "Output $/1K": f"{pricing.output_per_1k:.4f}" if pricing.output_per_1k or pricing.output_per_1k == 0 else "—",
+                            "Input $/1M": (
+                                f"{pricing.input_per_million:.4f}" if pricing.input_per_million is not None else "—"
+                            ),
+                            "Output $/1M": (
+                                f"{pricing.output_per_million:.4f}" if pricing.output_per_million is not None else "—"
+                            ),
+                            "Reasoning": reasoning_label,
+                        }
+                    )
+
+                if capabilities_rows:
+                    st.dataframe(capabilities_rows, use_container_width=True)
+                else:
+                    st.info("No models flagged for UI in this profile.")
+
+                st.markdown("#### Policies")
+                policies = registry.policies
+                st.write(
+                    f"• Max concurrent requests: {policies.max_concurrent_requests}\n"
+                    f"• Frontend temperature control: {'enabled' if policies.allow_frontend_temperature else 'disabled'}\n"
+                    f"• Frontend model selection: {'enabled' if policies.allow_frontend_model_selection else 'disabled'}"
+                )
 
     with tab_template:
         st.markdown("### Manage Templates")

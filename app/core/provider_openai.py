@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from urllib.parse import urlencode
+
 import httpx
+
+from app.core.config_schema import ReasoningConfig, RetryConfig, TimeoutConfig
+from app.core.model_registry import ModelDescriptor
 
 
 @lru_cache(maxsize=32)
@@ -163,24 +168,28 @@ class OpenAIProvider:
 
 @dataclass
 class OAIGateway:
-    """OpenAI-compatible gateway with robust fallbacks for vision + JSON.
-
-    - Adds OpenRouter header handling.
-    - Supports two vision encodings (image_url data URIs, and input_image objects) with fallback.
-    - Selects Tools or JSON mode based on detected capabilities and preferences.
-    - Retries on timeouts and 5xx.
-    """
+    """OpenAI-compatible gateway that works with registry-provided descriptors."""
 
     base_url: str
-    api_key: Optional[str]
-    headers: Optional[Dict[str, str]]
-    timeout: int
+    timeouts: TimeoutConfig
+    retry_config: RetryConfig
     prefer_json_mode: bool
     prefer_tools: bool
-    detected_caps: Optional[Dict[str, Any]] = None
+    default_temperature: float
+    default_top_p: Optional[float]
+    max_output_tokens: Optional[int]
+    max_temperature: float
+    headers: Optional[Dict[str, str]] = None
+    capabilities: Optional[Dict[str, Any]] = None
+    max_tokens_param_override: Optional[str] = None
     cached_max_tokens_param: Optional[str] = None
-    provider_id: Optional[int] = None
-    
+    allow_input_image_fallback: bool = True
+    provider_id: Optional[str] = None
+    auth_mode: str = "bearer_token"
+    auth_token: Optional[str] = None
+    auth_header_name: Optional[str] = None
+    auth_query_param: Optional[str] = None
+    reasoning: Optional[ReasoningConfig] = None
     def _is_local_model(self) -> bool:
         """Check if this is a local model endpoint."""
         if not self.base_url:
@@ -217,11 +226,18 @@ class OAIGateway:
 
     def _headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            h["Authorization"] = f"Bearer {self.api_key}"
-        # Merge user headers first, then ensure OpenRouter-required headers exist with sensible defaults.
         if self.headers:
             h.update(self.headers)
+
+        if self.auth_mode == "bearer_token" and self.auth_token:
+            header_name = self.auth_header_name or "Authorization"
+            value = self.auth_token
+            if header_name.lower() == "authorization" and not value.lower().startswith("bearer "):
+                value = f"Bearer {value}"
+            h[header_name] = value
+        elif self.auth_mode == "header" and self.auth_token and self.auth_header_name:
+            h[self.auth_header_name] = self.auth_token
+
         if "openrouter.ai" in (self.base_url or ""):
             # OpenRouter requires HTTP-Referer and X-Title; keep user overrides if provided.
             h.setdefault("HTTP-Referer", (self.headers or {}).get("HTTP-Referer", "http://localhost"))
@@ -248,14 +264,18 @@ class OAIGateway:
         return data
 
     def _client(self) -> httpx.Client:
-        # Use 1 hour timeout to prevent premature timeouts with slow models
-        t = httpx.Timeout(3600, connect=3600, read=3600, write=3600)
-        return httpx.Client(timeout=t)
+        timeout = httpx.Timeout(
+            self.timeouts.total_s,
+            connect=self.timeouts.connect_s,
+            read=self.timeouts.read_s,
+            write=self.timeouts.read_s,
+        )
+        return httpx.Client(timeout=timeout)
 
-    def _post_with_retries(self, url: str, json_payload: Dict[str, Any], max_retries: int = 3) -> httpx.Response:
+    def _post_with_retries(self, url: str, json_payload: Dict[str, Any], max_retries: Optional[int] = None) -> httpx.Response:
         # Only show verbose debug on first attempt or if VERBOSE_DEBUG is set
         verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-        
+
         if verbose:
             print(f"Debug [API Request]: Making request to {url}")
             print(f"Debug [API Request]: Model: {json_payload.get('model', 'N/A')}")
@@ -269,24 +289,33 @@ class OAIGateway:
             # Don't show full payload to avoid leaking prompts with potential sensitive data
             payload_keys = list(json_payload.keys())
             print(f"Debug [API Request]: Payload keys: {payload_keys}")
-        
-        delay = 0.5
+
+        retries = max_retries if max_retries is not None else max(self.retry_config.max_retries, 0)
+        retries = max(1, retries)
+        delay = self.retry_config.backoff_s or 0.5
         last_exc: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
+        retryable = set(self.retry_config.retry_on or [429, 500, 502, 503, 504])
+
+        for attempt in range(1, retries + 1):
             # Only show attempt info if it's a retry (attempt > 1) or there's an error
             try:
                 with self._client() as client:
-                    resp = client.post(url, headers=self._headers(), json=json_payload)
-                    
+                    request_url = url
+                    if self.auth_mode == "query" and self.auth_token and self.auth_query_param:
+                        query = urlencode({self.auth_query_param: self.auth_token})
+                        request_url = f"{url}{'&' if '?' in url else '?'}{query}"
+
+                    resp = client.post(request_url, headers=self._headers(), json=json_payload)
+
                     # Check for retryable errors
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    if resp.status_code in retryable:
                         error_body = resp.text if hasattr(resp, 'text') else 'No body'
-                        print(f"⚠️ Retryable error {resp.status_code} on attempt {attempt}/{max_retries}")
+                        print(f"⚠️ Retryable error {resp.status_code} on attempt {attempt}/{retries}")
                         if verbose:
                             print(f"   Error body: {error_body[:200]}")
                         last_exc = httpx.HTTPStatusError("server error", request=resp.request, response=resp)
                         raise last_exc
-                    
+
                     resp.raise_for_status()
                     
                     # Success - only show if it was a retry
@@ -296,27 +325,27 @@ class OAIGateway:
                         print(f"Debug [API Request]: Response status: {resp.status_code}")
                     
                     return resp
-                    
+
             except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
                 # Always show errors
                 if isinstance(e, httpx.TimeoutException):
-                    print(f"⏱️ Timeout on attempt {attempt}/{max_retries}")
-                elif not (hasattr(e, 'response') and e.response.status_code in (429, 500, 502, 503, 504)):
+                    print(f"⏱️ Timeout on attempt {attempt}/{retries}")
+                elif not (hasattr(e, 'response') and e.response.status_code in retryable):
                     # Non-retryable HTTP error
                     print(f"❌ HTTP Error on attempt {attempt}: {e}")
                     if verbose and hasattr(e, 'response'):
                         print(f"   Response: {e.response.text[:200] if hasattr(e.response, 'text') else 'No body'}")
-                
+
                 last_exc = e
-                if attempt >= max_retries:
+                if attempt >= retries:
                     break
-                    
+
                 print(f"   Retrying in {delay}s...")
                 time.sleep(delay)
                 delay = min(delay * 2, 4.0)
-        
+
         assert last_exc is not None
-        print(f"❌ All {max_retries} attempts failed")
+        print(f"❌ All {retries} attempts failed")
         raise last_exc
 
     @staticmethod
@@ -569,10 +598,91 @@ class OAIGateway:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
 
         # Unified params handling
-        effective_params = gen_params or params or {}
-        # Keep only universal params here; handle max token key via compatibility layer below
-        base_payload: Dict[str, Any] = {k: v for k, v in effective_params.items() if k in {"temperature", "top_p", "seed"}}
+        effective_params = dict(gen_params or params or {})
+
+        # Temperature defaults and clamping
+        temp = effective_params.get("temperature", self.default_temperature)
+        try:
+            temp_val = float(temp)
+        except (TypeError, ValueError):
+            temp_val = self.default_temperature
+        temp_val = max(0.0, min(temp_val, self.max_temperature))
+        effective_params["temperature"] = temp_val
+
+        # Top-p defaults and clamping
+        if "top_p" not in effective_params and self.default_top_p is not None:
+            effective_params["top_p"] = self.default_top_p
+        if "top_p" in effective_params:
+            try:
+                top_p_val = float(effective_params["top_p"])
+            except (TypeError, ValueError):
+                top_p_val = 1.0
+            top_p_val = max(0.0, min(top_p_val, 1.0))
+            effective_params["top_p"] = top_p_val
+
+        # Max tokens defaults and clamping
         max_tokens_val = effective_params.get("max_tokens")
+        limit = self.max_output_tokens if self.max_output_tokens not in (None, 0) else None
+        if max_tokens_val is None and limit is not None:
+            effective_params["max_tokens"] = limit
+            max_tokens_val = limit
+        elif max_tokens_val is not None:
+            try:
+                max_tokens_val = int(max_tokens_val)
+            except (TypeError, ValueError):
+                max_tokens_val = limit
+            if limit is not None and max_tokens_val is not None:
+                max_tokens_val = min(max_tokens_val, limit)
+            if max_tokens_val is not None:
+                effective_params["max_tokens"] = max_tokens_val
+
+        extra_body_payload: Dict[str, Any] = {}
+        raw_extra_body = effective_params.pop("extra_body", None)
+        if isinstance(raw_extra_body, dict):
+            extra_body_payload = dict(raw_extra_body)
+
+        reasoning_payload: Optional[Dict[str, Any]] = None
+        if self.reasoning and self.reasoning.provider and self.reasoning.provider != "none":
+            provider_key = self.reasoning.provider
+
+            # Respect user-provided overrides when allowed
+            user_reasoning_effort = effective_params.get("reasoning_effort")
+
+            if provider_key == "openai":
+                if (
+                    "reasoning" not in effective_params
+                    and not reasoning_payload
+                    and self.reasoning.effort_default
+                    and not user_reasoning_effort
+                ):
+                    reasoning_payload = {"effort": self.reasoning.effort_default}
+            elif provider_key == "google":
+                if self.reasoning.effort_default and not user_reasoning_effort:
+                    effective_params.setdefault("reasoning_effort", self.reasoning.effort_default)
+                google_section = extra_body_payload.get("google")
+                if isinstance(google_section, dict):
+                    google_section.pop("thinking_config", None)
+            # allow_override False -> enforce defaults
+            if self.reasoning.allow_override is False:
+                if provider_key == "openai" and self.reasoning.effort_default:
+                    reasoning_payload = {"effort": self.reasoning.effort_default}
+                    effective_params.pop("reasoning_effort", None)
+                if provider_key == "google":
+                    if self.reasoning.effort_default:
+                        effective_params["reasoning_effort"] = self.reasoning.effort_default
+                    google_section = extra_body_payload.get("google")
+                    if isinstance(google_section, dict):
+                        google_section.pop("thinking_config", None)
+
+        # Keep only universal params here; handle max token key via compatibility layer below
+        base_payload: Dict[str, Any] = {
+            k: v for k, v in effective_params.items() if k in {"temperature", "top_p", "seed"}
+        }
+        additional_payload: Dict[str, Any] = {
+            k: v
+            for k, v in effective_params.items()
+            if k not in {"temperature", "top_p", "seed", "max_tokens"}
+        }
 
         # Messages assembly
         payload_messages: List[Dict[str, Any]] = []
@@ -594,18 +704,16 @@ class OAIGateway:
         # Build user message later per encoding variant
 
         # Decide modes - be more conservative with local models
-        caps = self.detected_caps or {}
+        caps = self.capabilities or {}
         is_local = self._is_local_model()
-        
-        # Local models often don't support tools or JSON mode properly
-        if is_local and self.detected_caps is None:
-            # For unprobed local models, assume no advanced features
+
+        if is_local and not caps:
             tools_ok = False
             json_ok = False
         else:
-            tools_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("tools"))
-            json_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("json_mode"))
-        
+            tools_ok = bool(caps.get("tools"))
+            json_ok = bool(caps.get("json_mode")) or bool(caps.get("structured_output"))
+
         use_tools = bool(self.prefer_tools and tools_ok and schema)
         use_json_mode = bool((not use_tools) and self.prefer_json_mode and json_ok)
 
@@ -690,14 +798,16 @@ class OAIGateway:
         def _send_with_max_variants(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             # Get verbose flag for debug output
             verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-            
+
             # Use persisted cached parameter if available
+            if self.max_tokens_param_override and not self.cached_max_tokens_param:
+                self.cached_max_tokens_param = self.max_tokens_param_override
             cached_param = self.cached_max_tokens_param
-            
+
             tried: List[str] = []
             last_exc: Optional[httpx.HTTPStatusError] = None
             failed_with_none = False
-            
+
             # Build ordered candidates
             if cached_param and max_tokens_val is not None:
                 # Use cached successful parameter first, then try None if it fails
@@ -737,8 +847,13 @@ class OAIGateway:
                     if verbose:
                         print(f"   Testing without max_tokens parameter")
                 
+                payload.update(additional_payload)
                 payload = attach_modes(payload)
-                
+                if reasoning_payload and "reasoning" not in payload:
+                    payload["reasoning"] = reasoning_payload
+                if extra_body_payload and "extra_body" not in payload:
+                    payload["extra_body"] = extra_body_payload
+
                 try:
                     # Use reduced retries for parameter testing
                     test_retries = 1 if len(tried) > 1 else 2
@@ -748,15 +863,6 @@ class OAIGateway:
                     if key and max_tokens_val is not None and not cached_param:
                         self.cached_max_tokens_param = key
                         print(f"✅ Parameter '{key}' works - caching for future requests")
-                        
-                        # Persist to database if provider_id is available
-                        if self.provider_id:
-                            try:
-                                from app.core import storage
-                                storage.update_provider(self.provider_id, cached_max_tokens_param=key)
-                            except Exception as e:
-                                if verbose:
-                                    print(f"Warning: Could not persist cached parameter: {e}")
                     elif key is None and max_tokens_val is not None:
                         print(f"ℹ️ Model works without max_tokens parameter")
                     
@@ -787,14 +893,6 @@ class OAIGateway:
                             print(f"⚠️ Cached parameter '{key}' no longer works, clearing cache")
                             self.cached_max_tokens_param = None
                             cached_param = None
-                            
-                            # Clear from database if provider_id is available
-                            if self.provider_id:
-                                try:
-                                    from app.core import storage
-                                    storage.update_provider(self.provider_id, cached_max_tokens_param=None)
-                                except Exception:
-                                    pass
                         # Don't print for every failed attempt
                         if len(tried) <= 3 or verbose:
                             print(f"   ❌ Parameter '{key}' not supported")
@@ -958,7 +1056,7 @@ class OAIGateway:
             except Exception:
                 body_text = ""
             # Check if we should fallback to EncB
-            if status in (400, 415, 422):
+            if status in (400, 415, 422) and self.allow_input_image_fallback:
                 bt = (body_text or "").lower()
                 # Retry once with EncB (input_image) and re-run token key variants
                 if ("image_url" in bt) or ("data:" in bt) or True:
@@ -976,3 +1074,32 @@ class OAIGateway:
             return error_out(status, body_text or "", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
         except httpx.TimeoutException:
             return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+
+
+def gateway_from_descriptor(descriptor: ModelDescriptor) -> OAIGateway:
+    capabilities = descriptor.capabilities.model_dump()
+    compatibility = descriptor.compatibility
+    max_tokens_param = compatibility.max_tokens_param
+    allow_input_image = compatibility.allow_input_image_fallback
+    return OAIGateway(
+        base_url=descriptor.base_url,
+        timeouts=descriptor.timeouts,
+        retry_config=descriptor.retry,
+        prefer_json_mode=descriptor.force_json_mode,
+        prefer_tools=descriptor.prefer_tools,
+        default_temperature=descriptor.default_temperature,
+        default_top_p=descriptor.default_top_p,
+        max_output_tokens=descriptor.max_output_tokens,
+        max_temperature=descriptor.max_temperature,
+        headers=descriptor.extra_headers(),
+        capabilities=capabilities,
+        max_tokens_param_override=max_tokens_param,
+        cached_max_tokens_param=max_tokens_param,
+        allow_input_image_fallback=allow_input_image,
+        provider_id=descriptor.provider_id,
+        auth_mode=descriptor.provider_auth.auth_mode,
+        auth_token=descriptor.provider_auth.auth_token,
+        auth_header_name=descriptor.provider_auth.auth_header_name,
+        auth_query_param=descriptor.provider_auth.auth_query_param,
+        reasoning=descriptor.reasoning,
+    )

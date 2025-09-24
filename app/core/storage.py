@@ -10,6 +10,8 @@ from typing import Generator, Iterable, Optional
 from sqlalchemy import JSON, Float, ForeignKey, String, Boolean, create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
 
+from app.core.model_registry import ModelDescriptor
+
 DB_PATH = Path("data/app.db")
 
 
@@ -307,6 +309,60 @@ def record_run(provider_id: int, template_id: int | None, input_images: list | N
         db.commit()
         db.refresh(r)
         return r
+
+
+def ensure_registry_provider(descriptor: ModelDescriptor) -> Provider:
+    """Ensure a database provider row exists for registry-backed descriptors."""
+    name = f"Registry::{descriptor.provider_id}:{descriptor.id}"
+    caps_dump = descriptor.capabilities.model_dump()
+    headers = descriptor.extra_headers()
+
+    with get_db() as db:
+        provider = (
+            db.query(Provider)
+            .filter(Provider.provider_code == descriptor.provider_id, Provider.model_id == descriptor.id)
+            .first()
+        )
+
+        if not provider:
+            provider = Provider(
+                name=name,
+                base_url=descriptor.base_url,
+                provider_code=descriptor.provider_id,
+                model_id=descriptor.id,
+                key_storage="encrypted",
+                api_key_enc=None,
+                headers_json=headers or {},
+                timeout_s=descriptor.timeouts.total_s,
+                catalog_caps_json=caps_dump,
+                detected_caps_json=caps_dump,
+                default_temperature=descriptor.default_temperature,
+                default_top_p=descriptor.default_top_p,
+                default_max_output_tokens=descriptor.max_output_tokens,
+                default_force_json_mode=descriptor.force_json_mode,
+                default_prefer_tools=descriptor.prefer_tools,
+                is_active=True,
+            )
+            db.add(provider)
+        else:
+            provider.name = name
+            provider.base_url = descriptor.base_url
+            provider.provider_code = descriptor.provider_id
+            provider.model_id = descriptor.id
+            provider.headers_json = headers or {}
+            provider.timeout_s = descriptor.timeouts.total_s
+            provider.catalog_caps_json = caps_dump
+            provider.detected_caps_json = caps_dump
+            provider.default_temperature = descriptor.default_temperature
+            provider.default_top_p = descriptor.default_top_p
+            provider.default_max_output_tokens = descriptor.max_output_tokens
+            provider.default_force_json_mode = descriptor.force_json_mode
+            provider.default_prefer_tools = descriptor.prefer_tools
+            provider.is_active = True
+
+        db.commit()
+        db.refresh(provider)
+        return provider
 
 
 def list_runs(limit: int = 50) -> list[Run]:

@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,7 +22,8 @@ if str(_ROOT) not in sys.path:
 from app.core import storage
 from app.core.cost import cost_from_usage
 from app.core.json_enforcer import strip_code_fences
-from app.core.provider_openai import OAIGateway
+from app.core.model_registry import ModelRegistryError, ModelDescriptor, ensure_registry, active_model
+from app.core.provider_openai import gateway_from_descriptor
 from app.core.templating import RenderedMessages, render_user_prompt
 from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes, to_xlsx_bytes
 
@@ -30,9 +32,52 @@ UPLOAD_DIR = Path("data/uploads")
 EXPORT_DIR = Path("export")
 
 
+@dataclass
+class ModelContext:
+    descriptor: ModelDescriptor
+    provider_record: storage.Provider
+    caps: Dict[str, Any]
+    pricing: Dict[str, Any]
+    reasoning: Dict[str, Any]
+
+
 def _ensure_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _build_model_context(descriptor: ModelDescriptor) -> ModelContext:
+    provider_record = storage.ensure_registry_provider(descriptor)
+    caps = descriptor.capabilities.model_dump()
+    pricing_cfg = descriptor.pricing
+    pricing: Dict[str, Any] = {
+        "pricing": {
+            "input_per_1k": pricing_cfg.input_per_1k,
+            "output_per_1k": pricing_cfg.output_per_1k,
+        }
+    }
+    if pricing_cfg.cache_read_per_1k is not None:
+        pricing["pricing"]["cache_read"] = pricing_cfg.cache_read_per_1k
+    if pricing_cfg.cache_write_per_1k is not None:
+        pricing["pricing"]["cache_write"] = pricing_cfg.cache_write_per_1k
+    pricing["pricing"]["input_per_million"] = pricing_cfg.input_per_million
+    pricing["pricing"]["output_per_million"] = pricing_cfg.output_per_million
+    pricing["pricing"]["cache_read_per_million"] = pricing_cfg.cache_read_per_million
+    pricing["pricing"]["cache_write_per_million"] = pricing_cfg.cache_write_per_million
+    reasoning_cfg = descriptor.reasoning
+    reasoning = {
+        "provider": reasoning_cfg.provider if reasoning_cfg else None,
+        "effort_default": reasoning_cfg.effort_default if reasoning_cfg else None,
+        "include_thoughts_default": reasoning_cfg.include_thoughts_default if reasoning_cfg else False,
+        "allow_override": reasoning_cfg.allow_override if reasoning_cfg else True,
+    }
+    return ModelContext(
+        descriptor=descriptor,
+        provider_record=provider_record,
+        caps=caps,
+        pricing=pricing,
+        reasoning=reasoning,
+    )
 
 
 def _sanitize_filename(name: str) -> str:
@@ -164,79 +209,16 @@ def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
 
 def _image_capable() -> bool:
     """Check if active provider supports images."""
-    p = storage.get_active_provider()
-    if not p:
-        return True  # unknown; don't block
-    if isinstance(p.detected_caps_json, dict):
-        v = p.detected_caps_json.get("vision")
-        if isinstance(v, bool):
-            return v
-    mods = None
-    if isinstance(p.catalog_caps_json, dict):
-        mods = p.catalog_caps_json.get("modality") or p.catalog_caps_json.get("modalities")
-    if isinstance(mods, list):
-        return "image" in mods
-    return False
-
-
-def _get_active_provider_and_key() -> tuple[Optional[storage.Provider], Optional[str]]:
-    """Get active provider and corresponding API key (by provider_code)."""
-    p = storage.get_active_provider()
-    if not p:
-        return None, None
-    # Preferred path: provider-scoped key
-    api_key: Optional[str] = None
-    provider_code = (p.provider_code or "").strip().lower()
-    if provider_code:
-        # Check session-scoped key bucket by provider_code
-        sess_keys: Dict[str, str] = st.session_state.get("_provider_api_keys", {})
-        api_key = sess_keys.get(provider_code)
-        if not api_key:
-            # Fallback to persisted, encrypted key
-            api_key = storage.get_decrypted_api_key(provider_code)
-    else:
-        # Backwards compatibility: use legacy per-profile storage
-        if p.key_storage == "session":
-            keys: Dict[int, str] = st.session_state.get("_api_keys", {})
-            api_key = keys.get(p.id)
-        else:
-            try:
-                from cryptography.fernet import Fernet
-                kms_key = os.getenv("APP_KMS_KEY")
-                if not kms_key:
-                    try:
-                        kms_path = Path("data/kms.key")
-                        if kms_path.exists():
-                            kms_key = kms_path.read_text(encoding="utf-8").strip()
-                    except Exception:
-                        kms_key = None
-                if kms_key and p.api_key_enc:
-                    api_key = Fernet(kms_key).decrypt(p.api_key_enc.encode()).decode()
-            except Exception:
-                api_key = None
-    return p, api_key
-
-
-def _derive_request_plan(p: Optional[storage.Provider], schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Determine how to send request based on capabilities."""
-    plan = {"use_tools": False, "use_json_mode": False, "fallback": "prompt"}
-    if not p:
-        return plan
-    supports = p.detected_caps_json or {}
-    tools_ok = bool(supports.get("tools")) if isinstance(supports, dict) else False
-    json_ok = bool(supports.get("json_mode")) if isinstance(supports, dict) else False
-    if p.default_prefer_tools and tools_ok and bool(schema):
-        plan.update({"use_tools": True, "fallback": "json_mode" if (p.default_force_json_mode and json_ok) else "prompt"})
-        return plan
-    if p.default_force_json_mode and json_ok:
-        plan.update({"use_json_mode": True, "fallback": "prompt"})
-        return plan
-    return plan
+    try:
+        descriptor = active_model()
+    except ModelRegistryError:
+        return True
+    return bool(descriptor.capabilities.vision)
 
 
 def _process_images(
-    provider: storage.Provider,
-    api_key: str,
+    model_ctx: ModelContext,
+    gateway,
     template: storage.Template,
     image_paths: List[str],
     tags: Dict[str, Dict[str, str]],
@@ -273,63 +255,37 @@ def _process_images(
                     user_text = part.get("text", "")
                     break
     
-    # Create gateway with proper timeout
-    # Smart timeout defaults: longer for local models
-    url_lower = (provider.base_url or "").lower()
-    is_local_model = any(indicator in url_lower for indicator in [
-        "localhost", "127.0.0.1", "0.0.0.0", "192.168.",
-        "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
-        "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
-        "172.28.", "172.29.", "172.30.", "172.31.",  # Private IP range B
-        "host.docker.internal", ".local", ".lan", ":1234", ":5000", ":5001",
-        ":8000", ":8080", ":8888", ":9000", ":11434", ":7860", ":7861"
-    ])
-    
-    # Special check for 10.x.x.x range
-    if not is_local_model and "10." in url_lower:
-        import re
-        if re.search(r'(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
-            is_local_model = True
-    
-    # Use 1 hour timeout to prevent premature timeouts
-    default_timeout = 3600
-    
-    gateway = OAIGateway(
-        base_url=provider.base_url,
-        api_key=api_key,
-        headers=provider.headers_json or {},
-        timeout=int(provider.timeout_s or default_timeout),
-        prefer_json_mode=False if unstructured else bool(provider.default_force_json_mode),
-        prefer_tools=False if unstructured else bool(provider.default_prefer_tools),
-        detected_caps=provider.detected_caps_json,
-        cached_max_tokens_param=provider.cached_max_tokens_param,
-        provider_id=provider.id
-    )
-    
+    descriptor = model_ctx.descriptor
+
     # Execute request with proper max_tokens
     start_time = time.time()
-    
-    # Ensure max_output_tokens is properly set (default to 4096 if not set)
-    max_tokens = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
-    
+
+    max_tokens_limit = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else None
+    if max_tokens_limit is None:
+        fallback_limit = 4096
+    else:
+        fallback_limit = max_tokens_limit
+
     # Show request configuration
     print(f"📤 Processing {len(image_paths)} image(s)")
-    print(f"   Model: {provider.model_id}")
-    print(f"   Max tokens: {max_tokens}")
-    print(f"   Timeout: {provider.timeout_s or 120}s")
-    
+    print(f"   Model: {descriptor.id}")
+    print(f"   Max tokens: {fallback_limit}")
+    print(f"   Timeout: {descriptor.timeouts.total_s}s")
+
+    gen_params: Dict[str, Any] = {"temperature": descriptor.default_temperature}
+    if descriptor.default_top_p is not None:
+        gen_params["top_p"] = descriptor.default_top_p
+    if max_tokens_limit is not None:
+        gen_params["max_tokens"] = max_tokens_limit
+
     result = gateway.chat_vision(
-        model=provider.model_id or "gpt-4o-mini",
+        model=descriptor.id,
         system_text=template.system_prompt or "",
         user_text=user_text,
         image_paths=image_paths,
         fewshot_messages=None,
         schema=None if unstructured else template.schema_json,
-        gen_params={
-            "temperature": float(provider.default_temperature if provider.default_temperature is not None else 1.0),
-            "top_p": float(provider.default_top_p or 1.0),
-            "max_tokens": max_tokens  # Use the properly set max_tokens
-        }
+        gen_params=gen_params,
     )
     elapsed = time.time() - start_time
     
@@ -421,9 +377,12 @@ def run() -> None:
         if uploaded:
             saved_paths = _save_uploaded_files(uploaded)
             lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+            selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
             for pth in saved_paths:
                 if pth not in lst:
                     lst.append(pth)
+                if pth not in selected_lst:
+                    selected_lst.append(pth)
             if saved_paths:
                 st.success(f"✅ Uploaded {len(saved_paths)} file(s)")
     else:
@@ -466,11 +425,14 @@ def run() -> None:
                     st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
                 else:
                     lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                    selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
                     added = 0
                     for p in imgs_found:
                         if p not in lst:
                             lst.append(p)
                             added += 1
+                        if p not in selected_lst:
+                            selected_lst.append(p)
                     st.success(f"✅ Added {added} image(s) from folder")
     
     # Image Management (Simple List)
@@ -508,7 +470,12 @@ def run() -> None:
             
             with col1:
                 stable_key = f"sel_{hashlib.sha1(pth.encode('utf-8')).hexdigest()[:10]}"
-                checked = st.checkbox("", value=(pth in selected), key=stable_key)
+                checked = st.checkbox(
+                    "Select",
+                    value=(pth in selected),
+                    key=stable_key,
+                    label_visibility="collapsed",
+                )
                 if checked and pth not in selected:
                     selected.append(pth)
                 elif not checked and pth in selected:
@@ -550,26 +517,63 @@ def run() -> None:
         return
     
     st.divider()
-    
+
     # Process Section
     st.markdown("## 2️⃣ Process Images")
-    
-    # Get provider and template
-    provider, api_key = _get_active_provider_and_key()
-    if not provider:
-        st.error("❌ No active provider configured")
-        if st.button("Configure Provider"):
-            st.switch_page("pages/2_Settings.py")
+
+    try:
+        registry = ensure_registry()
+    except ModelRegistryError as exc:
+        st.error(f"❌ Model registry error: {exc}")
         return
-    
-    # Allow local endpoints without API key (e.g., LM Studio)
-    is_local = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
-    if not api_key and not is_local:
-        st.error("❌ No API key configured for active provider")
-        if st.button("Add API Key"):
-            st.switch_page("pages/2_Settings.py")
+
+    selectable_models = [
+        descriptor
+        for descriptor in registry.models.values()
+        if descriptor.show_in_ui
+    ]
+
+    selected_model_id = st.session_state.get("_selected_model_id")
+    try:
+        current_descriptor = registry.resolve(selected_model_id)
+    except ModelRegistryError:
+        current_descriptor = registry.resolve(None)
+        st.session_state["_selected_model_id"] = current_descriptor.id
+    else:
+        st.session_state["_selected_model_id"] = current_descriptor.id
+
+    if registry.policies.allow_frontend_model_selection and len(selectable_models) > 1:
+        options = sorted(
+            selectable_models,
+            key=lambda m: (m.provider_label.lower(), m.label.lower()),
+        )
+        default_index = next(
+            (idx for idx, mdl in enumerate(options) if mdl.id == current_descriptor.id),
+            0,
+        )
+        choice = st.selectbox(
+            "Select Model",
+            options=options,
+            index=default_index,
+            format_func=lambda mdl: f"{mdl.provider_label} • {mdl.label}",
+            help="Choose which configured model to use for this run.",
+            key="model_selection",
+        )
+        if choice.id != current_descriptor.id:
+            current_descriptor = choice
+            st.session_state["_selected_model_id"] = choice.id
+    else:
+        st.caption(f"Using model: {current_descriptor.provider_label} • {current_descriptor.label}")
+
+    # Load model context from registry
+    try:
+        model_ctx = _build_model_context(current_descriptor)
+    except Exception as exc:
+        st.error(f"❌ Failed to load model configuration: {exc}")
         return
-    
+
+    descriptor = model_ctx.descriptor
+
     # Template selection
     templates = storage.list_templates()
     if not templates:
@@ -596,10 +600,25 @@ def run() -> None:
     
     # Show current settings
     with st.expander("Current Settings", expanded=False):
-        st.write(f"**Model:** {provider.model_id}")
-        st.write(f"**Max Output Tokens:** {provider.default_max_output_tokens or 4096}")
-        st.write(f"**Temperature:** {provider.default_temperature if provider.default_temperature is not None else 1.0}")
-        st.write(f"**API Endpoint:** {provider.base_url}")
+        st.write(f"**Provider:** {descriptor.provider_label}")
+        st.write(f"**Model:** {descriptor.label}")
+        max_tokens_display = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else "Unlimited"
+        st.write(f"**Max Output Tokens:** {max_tokens_display}")
+        st.write(f"**Temperature:** {descriptor.default_temperature}")
+        st.write(f"**Endpoint:** {descriptor.base_url}")
+        per_million_in = model_ctx.pricing["pricing"].get("input_per_million")
+        per_million_out = model_ctx.pricing["pricing"].get("output_per_million")
+        if per_million_in is not None or per_million_out is not None:
+            in_display = f"${per_million_in:.4f}" if per_million_in is not None else "—"
+            out_display = f"${per_million_out:.4f}" if per_million_out is not None else "—"
+            st.write(f"**Price (input/output per 1M):** {in_display} / {out_display}")
+        reasoning_provider = model_ctx.reasoning.get("provider")
+        if reasoning_provider:
+            reason_parts = [reasoning_provider]
+            effort = model_ctx.reasoning.get("effort_default")
+            if effort:
+                reason_parts.append(str(effort))
+            st.write(f"**Reasoning defaults:** {', '.join(reason_parts)}")
     
     # Output mode toggle and Process button
     col1, col2, col3, col4 = st.columns([1.2, 1.4, 3.4, 1])
@@ -654,9 +673,13 @@ def run() -> None:
         st.session_state['per_file_mode_active'] = True
         for idx, img_path in enumerate(selected, start=1):
             try:
+                per_file_gateway = gateway_from_descriptor(descriptor)
+                if unstructured:
+                    per_file_gateway.prefer_json_mode = False
+                    per_file_gateway.prefer_tools = False
                 result = _process_images(
-                    provider,
-                    api_key or "",
+                    model_ctx,
+                    per_file_gateway,
                     selected_template,
                     [img_path],
                     tags,
@@ -710,9 +733,13 @@ def run() -> None:
         progress_text = f"Processing {len(selected)} image(s)... Estimated time: {estimated_time} seconds"
         
         with st.spinner(progress_text):
+            gateway = gateway_from_descriptor(descriptor)
+            if unstructured:
+                gateway.prefer_json_mode = False
+                gateway.prefer_tools = False
             result = _process_images(
-                provider,
-                api_key,
+                model_ctx,
+                gateway,
                 selected_template,
                 selected,
                 tags,
@@ -770,19 +797,10 @@ def run() -> None:
                 st.warning("🔧 **Server Error Detected**")
                 st.write("The provider's server is experiencing issues. Try:")
                 st.write("• Waiting a few minutes and trying again")
-                st.write("• Using a different model from the same provider")
-                st.write("• Switching to a different provider in Settings")
-                
-                # Show alternative providers if available
-                other_providers = [p for p in storage.list_providers() if p.id != provider.id]
-                if other_providers:
-                    st.info(f"💡 Alternative providers available: {', '.join([p.name for p in other_providers])}")
+                st.write("• Asking an administrator to verify the server configuration")
             elif "401" in error_msg or "403" in error_msg or "authentication" in error_msg:
                 st.warning("🔑 **Authentication Issue**")
-                st.write("There may be an issue with your API key. Check:")
-                st.write("• API key is valid and active")
-                st.write("• API key has sufficient credits/quota")
-                st.write("• API key has permissions for the selected model")
+                st.write("The configured server credentials may be invalid. Contact an administrator to refresh secrets or tokens.")
             elif "429" in error_msg or "rate" in error_msg:
                 st.warning("⏱️ **Rate Limit**")
                 st.write("You've hit the rate limit. Try:")
@@ -791,15 +809,15 @@ def run() -> None:
                 st.write("• Upgrading your API plan for higher limits")
             elif "timeout" in error_msg or "408" in error_msg:
                 st.warning("⏰ **Timeout Error**")
-                # Re-check if local model (is_local was defined earlier but might be out of scope)
-                is_local_error_check = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
+                base_url_lower = (descriptor.base_url or "").lower()
+                is_local_error_check = any(token in base_url_lower for token in ("localhost", "127.0.0.1", "0.0.0.0"))
                 if is_local_error_check:
                     st.write("Local models can be slow. Try:")
-                    st.write("• Increasing the timeout in Settings (current: " + str(int(provider.timeout_s or 120)) + "s)")
+                    st.write("• Increasing the server timeout (current: " + str(int(descriptor.timeouts.total_s)) + "s)")
                     st.write("• Using a smaller model")
                     st.write("• Reducing max_output_tokens")
                     st.write("• Processing one image at a time")
-                    if provider.timeout_s and provider.timeout_s < 300:
+                    if descriptor.timeouts.total_s < 300:
                         st.info("💡 Consider increasing timeout to 300+ seconds for local models")
                 else:
                     st.write("The request took too long. Try:")
@@ -984,9 +1002,10 @@ def run() -> None:
                     st.session_state['last_usage'] = {
                         'usage': usage,
                         'provider_info': {
-                            'model_id': provider.model_id,
-                            'max_output_tokens': provider.default_max_output_tokens,
-                            'catalog_caps_json': provider.catalog_caps_json
+                            'model_id': descriptor.id,
+                            'max_output_tokens': descriptor.max_output_tokens,
+                            'capabilities': model_ctx.caps,
+                            'pricing': model_ctx.pricing,
                         }
                     }
                 
@@ -1001,22 +1020,23 @@ def run() -> None:
                     st.write(f"**Total tokens:** {usage_data.get('total_tokens', 0):,}")
                     
                     # Warning if output seems truncated
-                    max_requested = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
-                    if output_tokens < 250 and max_requested > 1000:
-                        st.warning(f"⚠️ Output may be truncated: only {output_tokens} tokens generated out of {max_requested} requested. Check your model's configuration.")
+                    limit_tokens = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else 4096
+                    if output_tokens < 250 and limit_tokens > 1000:
+                        st.warning(f"⚠️ Output may be truncated: only {output_tokens} tokens generated out of {limit_tokens} requested. Check your model's configuration.")
                     
                     # Calculate cost if pricing available
-                    if provider.catalog_caps_json:
+                    if model_ctx.pricing:
                         from app.core.cost import cost_from_usage
-                        cost_info = cost_from_usage(usage_data, provider.catalog_caps_json)
-                        if cost_info and cost_info.get("total", 0) > 0:
-                            st.write(f"**Estimated cost:** ${cost_info['total']:.4f}")
+                        cost_info = cost_from_usage(usage_data, model_ctx.pricing)
+                        total_cost = cost_info.get("total_usd") if cost_info else None
+                        if total_cost:
+                            st.write(f"**Estimated cost:** ${total_cost:.4f}")
                             
                             # Track cumulative cost in session
                             if process_clicked:
                                 if 'cumulative_cost' not in st.session_state:
                                     st.session_state['cumulative_cost'] = 0.0
-                                st.session_state['cumulative_cost'] += cost_info['total']
+                                st.session_state['cumulative_cost'] += float(total_cost)
                             
                             # Show cumulative cost if multiple runs
                             if 'cumulative_cost' in st.session_state:
@@ -1027,13 +1047,13 @@ def run() -> None:
                 try:
                     # Calculate cost if pricing info available
                     cost_usd = None
-                    if result.get("usage") and provider.catalog_caps_json:
-                        cost_info = cost_from_usage(result["usage"], provider.catalog_caps_json)
+                    if result.get("usage") and model_ctx.pricing:
+                        cost_info = cost_from_usage(result["usage"], model_ctx.pricing)
                         if cost_info:
-                            cost_usd = cost_info.get("total")
+                            cost_usd = cost_info.get("total_usd")
                     
                     run = storage.record_run(
-                        provider_id=provider.id,
+                        provider_id=model_ctx.provider_record.id,
                         template_id=selected_template.id,
                         input_images=selected,
                         output=result["output"],
