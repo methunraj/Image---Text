@@ -74,6 +74,7 @@ class Template(Base):
     examples_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     yaml_blob: Mapped[str | None] = mapped_column(nullable=True)
     version_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
     updated_at: Mapped[datetime] = mapped_column(default=func.now(), onupdate=func.now())
 
@@ -173,6 +174,7 @@ def _run_migrations() -> None:
             "user_prompt": "TEXT",
             "yaml_blob": "TEXT",
             "version_tag": "TEXT",
+            "source_path": "TEXT",
         }
         for col, typ in add_map_t.items():
             if col not in cols_t:
@@ -249,9 +251,32 @@ def list_providers() -> list[Provider]:
         return db.query(Provider).order_by(Provider.name.asc()).all()
 
 
-def create_template(name: str, content: str, schema_json: dict | None = None, examples_json: list | None = None) -> Template:
+def create_template(
+    name: str,
+    content: str = "",
+    *,
+    description: str | None = None,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
+    schema_json: dict | None = None,
+    examples_json: list | None = None,
+    yaml_blob: str | None = None,
+    version_tag: str | None = None,
+    source_path: str | None = None,
+) -> Template:
     with get_db() as db:
-        t = Template(name=name, content=content, schema_json=schema_json or {}, examples_json=examples_json or [])
+        t = Template(
+            name=name,
+            content=content,
+            description=description,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_json=schema_json or {},
+            examples_json=examples_json or [],
+            yaml_blob=yaml_blob,
+            version_tag=version_tag,
+            source_path=source_path,
+        )
         db.add(t)
         db.commit()
         db.refresh(t)

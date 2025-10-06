@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.core import storage
+from app.core import template_assets
 from app.core.cost import cost_from_usage
 from app.core.json_enforcer import strip_code_fences
 from app.core.model_registry import ModelRegistryError, ModelDescriptor, ensure_registry, active_model
@@ -348,6 +349,7 @@ def run() -> None:
     st.caption("Upload images and extract structured data using AI")
     
     storage.init_db()
+    template_assets.sync_from_assets()
     _ensure_dirs()
     
     # Check capabilities

@@ -14,6 +14,7 @@ if str(_ROOT) not in sys.path:
 
 # Local imports
 from app.core import storage
+from app.core import template_assets
 from app.core import ui as core_ui
 from app.core.model_registry import ModelRegistryError, active_model, ensure_registry
 from app.core.models_dev import cache_provider_logo
@@ -65,6 +66,7 @@ def main() -> None:
     # Ensure folders exist and database is initialized
     _ensure_runtime_dirs()
     storage.init_db()
+    template_assets.sync_from_assets()
 
     if registry_error:
         st.error(f"Failed to load model configuration: {registry_error}")

@@ -80,7 +80,7 @@ On first run, `data/app.db` (SQLite) is created.
 - `app/pages/` – 4 pages (Settings, Upload, Templates, Run & Test).
 - `app/core/` – Storage, provider gateway, templating, JSON enforcement, cost, UI.
 - `config/models.xlsx` – Excel workbook defining profiles, providers, models, pricing, reasoning defaults.
-- `app/assets/` – Static assets, including sample templates.
+- `app/assets/` – Static assets, including sample templates. YAML files under `app/assets/templates/` are auto-imported on startup and updated when templates are saved in the Settings page.
 - `data/` and `export/` – Runtime dirs (gitignored).
 
 ## Sample Template & Images

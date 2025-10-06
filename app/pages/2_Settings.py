@@ -22,6 +22,7 @@ if str(_ROOT) not in sys.path:
 
 from app.core import ui as core_ui
 from app.core import storage
+from app.core import template_assets
 from app.core.model_registry import ModelRegistryError, active_model, config_metadata, ensure_registry, reload_registry
 from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path, cache_provider_logo
 from app.core.provider_endpoints import get_provider_base_urls
@@ -1424,6 +1425,7 @@ def _to_data_url(file) -> str:
 def _template_management() -> None:
     """Display template management interface."""
     storage.init_db()
+    template_assets.sync_from_assets()
     
     # Check if template was just saved
     if st.session_state.get("template_saved"):
@@ -1475,18 +1477,27 @@ Respond ONLY with JSON."""
                     if existing:
                         st.warning("Starter template already exists!")
                     else:
+                        starter_yaml = {
+                            "name": starter_name,
+                            "description": "A basic template for extracting common document fields",
+                            "system_prompt": starter_system,
+                            "user_prompt": starter_user,
+                            "schema": starter_schema,
+                            "examples": [],
+                        }
                         new_tpl = storage.create_template(
                             starter_name,
-                            content="",
                             schema_json=starter_schema,
-                            examples_json=[]
-                        )
-                        storage.update_template(
-                            new_tpl.id,
+                            examples_json=[],
                             description="A basic template for extracting common document fields",
                             system_prompt=starter_system,
-                            user_prompt=starter_user
+                            user_prompt=starter_user,
+                            yaml_blob=yaml.safe_dump(starter_yaml, sort_keys=False),
                         )
+                        try:
+                            template_assets.export_to_assets(new_tpl)
+                        except Exception as exc:
+                            st.warning(f"Starter template created but could not mirror to assets: {exc}")
                         st.success("✅ Starter template created!")
                         st.rerun()
                         
@@ -1613,30 +1624,35 @@ Respond ONLY with JSON."""
             st.error("Template name cannot be empty")
             return
 
+        serialized_examples = [asdict(e) for e in examples]
         body = {
             "name": normalized_name,
             "description": desc or None,
             "system_prompt": system_prompt or None,
             "user_prompt": user_prompt or None,
             "schema": schema_obj,
-            "examples": [asdict(e) for e in examples],
+            "examples": serialized_examples,
             "version_tag": (tpl.version_tag if tpl else None),
         }
         yaml_blob = yaml.safe_dump(body, sort_keys=False)
         if is_new:
             existing_tpl = storage.get_template_by_name(normalized_name)
             if existing_tpl:
-                storage.update_template(
+                updated_tpl = storage.update_template(
                     existing_tpl.id,
                     name=normalized_name,
                     description=desc or None,
                     system_prompt=system_prompt or None,
                     user_prompt=user_prompt or None,
                     schema_json=schema_obj,
-                    examples_json=[asdict(e) for e in examples],
+                    examples_json=serialized_examples,
                     yaml_blob=yaml_blob,
                     version_tag=existing_tpl.version_tag,
                 )
+                try:
+                    template_assets.export_to_assets(updated_tpl)
+                except Exception as exc:
+                    st.warning(f"Saved to database but could not mirror to assets: {exc}")
                 st.success("✅ Existing template overwritten with latest changes.")
                 st.session_state.template_saved = True
                 st.session_state.saved_template_name = normalized_name
@@ -1645,17 +1661,17 @@ Respond ONLY with JSON."""
                 try:
                     tnew = storage.create_template(
                         normalized_name,
-                        content="",
                         schema_json=schema_obj,
-                        examples_json=[asdict(e) for e in examples],
-                    )
-                    storage.update_template(
-                        tnew.id,
+                        examples_json=serialized_examples,
                         description=desc or None,
                         system_prompt=system_prompt or None,
                         user_prompt=user_prompt or None,
                         yaml_blob=yaml_blob,
                     )
+                    try:
+                        template_assets.export_to_assets(tnew)
+                    except Exception as exc:
+                        st.warning(f"Template created but could not mirror to assets: {exc}")
                     st.success("✅ Template created successfully!")
                     st.session_state.template_saved = True
                     st.session_state.saved_template_name = normalized_name
@@ -1663,16 +1679,20 @@ Respond ONLY with JSON."""
                 except Exception as exc:
                     st.error(f"Could not save template: {exc}")
         else:
-            storage.update_template(
+            updated_tpl = storage.update_template(
                 tpl.id,
                 name=normalized_name,
                 description=desc or None,
                 system_prompt=system_prompt or None,
                 user_prompt=user_prompt or None,
                 schema_json=schema_obj,
-                examples_json=[asdict(e) for e in examples],
+                examples_json=serialized_examples,
                 yaml_blob=yaml_blob,
             )
+            try:
+                template_assets.export_to_assets(updated_tpl)
+            except Exception as exc:
+                st.warning(f"Saved to database but could not mirror to assets: {exc}")
             st.success("✅ Template saved successfully!")
             # Save the success state and template name to session
             st.session_state.template_saved = True
@@ -1682,21 +1702,32 @@ Respond ONLY with JSON."""
     if clone_clicked and tpl:
         clone_name = st.text_input("Clone As Name", value=f"{tpl.name} (copy)")
         if st.button("Confirm Clone"):
-            t2 = storage.create_template(
-                clone_name.strip(), content="", schema_json=tpl.schema_json, examples_json=tpl.examples_json
-            )
-            storage.update_template(
-                t2.id,
-                description=tpl.description,
-                system_prompt=tpl.system_prompt,
-                user_prompt=tpl.user_prompt,
-                yaml_blob=tpl.yaml_blob,
-                version_tag=tpl.version_tag,
-            )
-            st.success("Template cloned")
-            st.rerun()
+            new_name = clone_name.strip()
+            try:
+                cloned_tpl = storage.create_template(
+                    new_name,
+                    schema_json=tpl.schema_json,
+                    examples_json=tpl.examples_json,
+                    description=tpl.description,
+                    system_prompt=tpl.system_prompt,
+                    user_prompt=tpl.user_prompt,
+                    yaml_blob=tpl.yaml_blob,
+                    version_tag=tpl.version_tag,
+                )
+                try:
+                    template_assets.export_to_assets(cloned_tpl)
+                except Exception as exc:
+                    st.warning(f"Template cloned but could not mirror to assets: {exc}")
+                st.success("Template cloned")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to clone template: {exc}")
 
     if del_clicked and tpl:
+        try:
+            template_assets.delete_from_assets(tpl)
+        except Exception as exc:
+            st.warning(f"Could not remove asset file: {exc}")
         storage.delete_template(tpl.id)
         st.warning("Template deleted")
         st.rerun()
