@@ -82,7 +82,7 @@ def _template_to_dict(template: storage.Template) -> Dict[str, Any]:
 
 
 def _canonical_yaml(data: Dict[str, Any]) -> str:
-    return yaml.safe_dump(data, sort_keys=False, allow_unicode=False)
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
 
 
 def _relativize(path: Path) -> str:

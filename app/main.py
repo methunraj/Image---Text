@@ -22,6 +22,21 @@ from app.core.models_dev import cache_provider_logo
 
 def _get_active_profile() -> tuple[str, str | None]:
     """Resolve the active model/profile and logo from DB or env."""
+    # Prefer an explicitly active provider saved in DB (from Settings)
+    try:
+        db_active = storage.get_active_provider()
+        if db_active is not None:
+            # Compose a human-readable label
+            label_parts = []
+            if db_active.provider_code:
+                label_parts.append(db_active.provider_code)
+            if db_active.model_id:
+                label_parts.append(db_active.model_id)
+            composed = " • ".join(label_parts) if label_parts else (db_active.name or "Active Model")
+            logo = db_active.logo_path
+            return composed, logo
+    except Exception:
+        pass
     try:
         descriptor = active_model()
         name = descriptor.label

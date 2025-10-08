@@ -370,6 +370,12 @@ class OAIGateway:
         return {"role": "user", "content": parts}
 
     def _extract_text_and_tool(self, data: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+        if not verbose:
+            def _noop(*args, **kwargs):
+                return None
+            # Shadow print locally for non-verbose mode
+            print = _noop  # type: ignore
         text: Optional[str] = None
         tool_call: Optional[Dict[str, Any]] = None
         
@@ -498,6 +504,12 @@ class OAIGateway:
 
     def _openrouter_extract_text(self, data: Dict[str, Any]) -> Optional[str]:
         """OpenRouter-specific text extraction fallbacks"""
+        verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+        if not verbose:
+            def _noop(*args, **kwargs):
+                return None
+            # Shadow print locally for non-verbose mode
+            print = _noop  # type: ignore
         print(f"Debug [_openrouter_extract_text]: Checking OpenRouter-specific patterns")
         
         # Check for non-standard response structures that OpenRouter might use
@@ -938,6 +950,11 @@ class OAIGateway:
             # First, capture the raw response body before JSON parsing
             raw_body = resp.text
             verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+            if not verbose:
+                def _noop(*args, **kwargs):
+                    return None
+                # Shadow print locally for non-verbose mode
+                print = _noop  # type: ignore
             
             if verbose:
                 print(f"Debug [Response]: RAW HTTP Response Body:")
@@ -1059,7 +1076,7 @@ class OAIGateway:
             if status in (400, 415, 422) and self.allow_input_image_fallback:
                 bt = (body_text or "").lower()
                 # Retry once with EncB (input_image) and re-run token key variants
-                if ("image_url" in bt) or ("data:" in bt) or True:
+                if ("image_url" in bt) or ("data:" in bt):
                     enc_used = "EncB"
                     messages_b = payload_messages + [self._build_user_with_images_enc_b(user_text, image_paths)]
                     try:

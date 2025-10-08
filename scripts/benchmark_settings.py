@@ -84,12 +84,40 @@ def benchmark_optimized():
     
     # Import optimized page (renamed import to match filename)
     import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "Settings_optimized", 
-        Path(__file__).resolve().parents[1] / "app" / "pages" / "2_Settings_optimized.py"
-    )
-    optimized_settings = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(optimized_settings)
+    optimized_path = Path(__file__).resolve().parents[1] / "app" / "pages" / "2_Settings_optimized.py"
+    if not optimized_path.exists():
+        print("(optimized page not found — skipping and reusing original for comparison)")
+        # Fallback: import the original page module and provide minimal wrappers
+        spec = importlib.util.spec_from_file_location(
+            "Settings_original", 
+            Path(__file__).resolve().parents[1] / "app" / "pages" / "2_Settings.py"
+        )
+        optimized_settings = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(optimized_settings)
+        # Provide stubbed cached helpers when not present
+        if not hasattr(optimized_settings, "_get_cached_catalog_wrapper"):
+            from app.core.models_dev import get_cached_catalog as _real_catalog
+            def _get_cached_catalog_wrapper():
+                return _real_catalog()
+            optimized_settings._get_cached_catalog_wrapper = _get_cached_catalog_wrapper  # type: ignore
+        if not hasattr(optimized_settings, "_init_database"):
+            from app.core import storage as _storage
+            def _init_database():
+                _storage.init_db()
+                return True
+            optimized_settings._init_database = _init_database  # type: ignore
+        if not hasattr(optimized_settings, "_get_providers_list"):
+            from app.core import storage as _storage
+            def _get_providers_list():
+                return _storage.list_providers()
+            optimized_settings._get_providers_list = _get_providers_list  # type: ignore
+    else:
+        spec = importlib.util.spec_from_file_location(
+            "Settings_optimized", 
+            optimized_path
+        )
+        optimized_settings = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(optimized_settings)
     
     import_time = time.time() - start_time
     import_memory = tracemalloc.get_traced_memory()[0] - start_memory

@@ -4,7 +4,7 @@ A lightweight, modular Streamlit app for turning images into structured JSON usi
 
 ## Features
 
-- Clean 4‑page flow (Settings, Upload, Templates, Run & Test).
+- Clean 2‑page flow (Settings, Upload & Process).
 - Server-side model registry maintained in `config/models.xlsx` (profiles, capabilities, per-million pricing, limits).
 - Optional encrypted secrets managed via `scripts/secretset.py` + Fernet/`APP_KMS_KEY`.
 - Template management with schema editor, few‑shots, import/export (YAML/JSON), and live preview rendering.
@@ -45,25 +45,13 @@ On first run, `data/app.db` (SQLite) is created.
 ## App Flow
 
 - Settings (⚙):
-  - View registry metadata (active profile, Excel source, defaults, policies, pricing, and capabilities).
-  - Hot-reload the Excel-driven registry with validation feedback; secrets stay server-only.
-  - Template management (create, clone, import/export, schema editing) unchanged.
+  - Configure providers/models (base URL, headers, timeouts) and manage API keys (session or encrypted).
+  - Browse/select models from the catalog; probe capabilities; set an active profile in the local DB.
 
-- Upload (📤):
-  - Upload multiple images (PNG/JPG), persisted to `data/uploads/`.
-  - See thumbnails, select subset, and add per‑image tags (`doc_type`, `locale`).
-  - Guard banner if active model lacks image modality.
-
-- Templates (🧩):
-  - Create/clone/delete templates; set system and user prompts.
-  - Schema editor with validation; attach up to 3 few‑shot examples.
-  - Import/export YAML/JSON; live preview renders final message array.
-
-- Run & Test (🚀):
-  - Choose a template and images, review the request plan from capabilities + defaults.
-  - Run extraction per image using robust fallbacks; validate JSON with auto‑repair.
-  - Show raw text, validated JSON, repair attempts, usage (if present), cost, and latency.
-  - Save runs; define a test suite with assertions or golden JSON; run across profiles and export results.
+- Upload & Process (📤):
+  - Upload or select folders of images, tag images, select a template, and run extraction.
+  - View raw or structured output; export JSON/Markdown/XLSX/DOCX; usage and cost if available.
+  - Upload PDF(s): convert pages to images into a chosen folder (DPI/format/page range), update a folder checkpoint, and queue pending pages for processing.
 
 ## Pricing
 
@@ -77,7 +65,7 @@ On first run, `data/app.db` (SQLite) is created.
 ## Structure
 
 - `app/main.py` – App entry and sidebar chip.
-- `app/pages/` – 4 pages (Settings, Upload, Templates, Run & Test).
+- `app/pages/` – 2 pages (Settings, Upload & Process).
 - `app/core/` – Storage, provider gateway, templating, JSON enforcement, cost, UI.
 - `config/models.xlsx` – Excel workbook defining profiles, providers, models, pricing, reasoning defaults.
 - `app/assets/` – Static assets, including sample templates. YAML files under `app/assets/templates/` are auto-imported on startup and updated when templates are saved in the Settings page.

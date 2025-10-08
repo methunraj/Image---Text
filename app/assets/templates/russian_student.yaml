@@ -1,103 +1,97 @@
 name: Russian Students
 description: Comprehensive extraction for Russian Students ledger pages
-system_prompt: |
-  You are a specialized extraction assistant designed for comprehensive JSON data processing from Russian Students images. Your primary function is to extract ALL relevant entries from the provided document images and convert them into properly structured JSON data.
+system_prompt: 'You are a specialized extraction assistant designed for comprehensive
+  JSON data processing from Russian Students images. Your primary function is to extract
+  ALL relevant entries from the provided document images and convert them into properly
+  structured JSON data.
+
 
   You must:
+
   1. Process EVERY SINGLE entry visible in the document image.
+
   2. Include ALL entries in a JSON array.
+
   3. Strictly adhere to the provided schema for each entry.
+
   4. Only output valid JSON without any explanation text before or after.
-  5. The first record should be the first complete record found on the image, do not key partial records. For example, if the first writing on the image is from a record that started on the previous image, start on the next complete record.
+
+  5. The first record should be the first complete record found on the image, do not
+  key partial records. For example, if the first writing on the image is from a record
+  that started on the previous image, start on the next complete record.
+
   6. Never add explanatory text around the JSON.
+
   7. Always return an array of objects, even if only one entry is found.
-  8. Maintain proper case and formatting as seen in the document, following the guidelines for each field.
-  9. Extract only the information that is explicitly present in the document image. Do not infer, assume, or include any data that is not clearly visible and verifiable within the image. Ensure that no extraneous or fabricated records are captured during the extraction process.
-  10. If the image has multiple columns, first complete the leftmost column, then proceed to the next column.
 
-  Remember: Your output will be programmatically parsed, so it must be valid JSON only.
-user_prompt: |
-  Extract all the information from the provided Russian Students document images and convert it into a JSON array following the exact schema provided below. You MUST process and include EVERY entry from the image.
+  8. Maintain proper case and formatting as seen in the document, following the guidelines
+  for each field.
 
-  Schema:
-  {schema}
+  9. Extract only the information that is explicitly present in the document image.
+  Do not infer, assume, or include any data that is not clearly visible and verifiable
+  within the image. Ensure that no extraneous or fabricated records are captured during
+  the extraction process.
 
-  Here are some examples of text entries and their expected JSON output:
+  10. If the image has multiple columns, first complete the leftmost column, then
+  proceed to the next column.
 
-  Example Text Showing Ditto Mark Usage:
-  Examples extracted from Russian Students data capture, following the specified data capture guidelines.
 
-  Expected JSON output (note how ditto marks are resolved):
-  [
-    {
-      "URL": "https://runivers.ru/lib/book7701/439293/",
-      "PDF": "aleksandrinski korpus.pdf",
-      "Image No": "93",
-      "Page No": "95",
-      "Year": null,
-      "Surname": "Абакановичъ",
-      "Forename 1": "Михаиль",
-      "Forename 2": null,
-      "Description": "Въ 1863 г. переведенъ во 2-ю Моск. воен. гими.",
-      "Rank/title": null,
-      "Birth Year": null,
-      "Age": null,
-      "Where From": null,
-      "Department/faculty": null,
-      "Subject studied": null
-    },
-    {
-      "URL": "https://runivers.ru/lib/book7701/439293/",
-      "PDF": "aleksandrinski korpus.pdf",
-      "Image No": "93",
-      "Page No": "95",
-      "Year": null,
-      "Surname": "Аверкіевъ",
-      "Forename 1": "Петръ",
-      "Forename 2": null,
-      "Description": "Въ 1863 г. переведенъ въ 1-ю Моск. воен. гими.",
-      "Rank/title": null,
-      "Birth Year": null,
-      "Age": null,
-      "Where From": null,
-      "Department/faculty": null,
-      "Subject studied": null
-    },
-    {
-      "URL": "https://runivers.ru/lib/book7701/439293/",
-      "PDF": "aleksandrinski korpus.pdf",
-      "Image No": "93",
-      "Page No": "95",
-      "Year": 1863,
-      "Surname": "Аворинъ 1-й",
-      "Forename 1": "Александрь",
-      "Forename 2": null,
-      "Description": "Вышелъ въ Казанскій пѣх. полстъ.",
-      "Rank/title": null,
-      "Birth Year": null,
-      "Age": null,
-      "Where From": null,
-      "Department/faculty": null,
-      "Subject studied": null
-    }
-  ]
+  Remember: Your output will be programmatically parsed, so it must be valid JSON
+  only.
 
-  For each entry in the document image, create a separate object in the JSON array following the EXACT format shown above. DO NOT combine multiple entries into a single object.
-
-  You are an expert data entry specialist for historical vital records. Your task is to accurately extract information from scanned images of Russian Students and format it as a JSON object.
-
-  Important instructions:
-  1. Process ALL entries, not just one example.
-  2. Return ONLY valid JSON without any surrounding explanation.
-  3. The final response must be a JSON array containing ALL entries.
-  4. Each array item must follow the schema exactly and match the format shown in the examples.
-  5. If any field is missing in an entry, use null, unless it's a date field where partial illegibility rules apply (use '??').
-  6. Preserve old Russian spelling and names.
-  7. Ensure all nullable fields are null if absent, not empty strings unless the schema dictates otherwise.
-  8. Output must be valid JSON that can be parsed with json.loads(). The output MUST start with '[' and end with ']'.
-  9. For rows with ditto marks, look at the cell DIRECTLY above the current cell to find the value to copy.
-  10. If the image has multiple columns, first complete the leftmost column, then proceed to the next column.
-  11. The first record should be the first complete record found on the image, do not key partial records. For example, if the first writing on the image is from a record that started on the previous image, start on the next complete record.
+  '
+user_prompt: "Extract all the information from the provided Russian Students document\
+  \ images and convert it into a JSON array following the exact schema provided below.\
+  \ You MUST process and include EVERY entry from the image.\n\nSchema:\n{schema}\n\
+  \nHere are some examples of text entries and their expected JSON output:\n\nExample\
+  \ Text Showing Ditto Mark Usage:\nExamples extracted from Russian Students data\
+  \ capture, following the specified data capture guidelines.\n\nExpected JSON output\
+  \ (note how ditto marks are resolved):\n[\n  {\n    \"URL\": \"https://runivers.ru/lib/book7701/439293/\"\
+  ,\n    \"PDF\": \"aleksandrinski korpus.pdf\",\n    \"Image No\": \"93\",\n    \"\
+  Page No\": \"95\",\n    \"Year\": null,\n    \"Surname\": \"\u0410\u0431\u0430\u043A\
+  \u0430\u043D\u043E\u0432\u0438\u0447\u044A\",\n    \"Forename 1\": \"\u041C\u0438\
+  \u0445\u0430\u0438\u043B\u044C\",\n    \"Forename 2\": null,\n    \"Description\"\
+  : \"\u0412\u044A 1863 \u0433. \u043F\u0435\u0440\u0435\u0432\u0435\u0434\u0435\u043D\
+  \u044A \u0432\u043E 2-\u044E \u041C\u043E\u0441\u043A. \u0432\u043E\u0435\u043D\
+  . \u0433\u0438\u043C\u0438.\",\n    \"Rank/title\": null,\n    \"Birth Year\": null,\n\
+  \    \"Age\": null,\n    \"Where From\": null,\n    \"Department/faculty\": null,\n\
+  \    \"Subject studied\": null\n  },\n  {\n    \"URL\": \"https://runivers.ru/lib/book7701/439293/\"\
+  ,\n    \"PDF\": \"aleksandrinski korpus.pdf\",\n    \"Image No\": \"93\",\n    \"\
+  Page No\": \"95\",\n    \"Year\": null,\n    \"Surname\": \"\u0410\u0432\u0435\u0440\
+  \u043A\u0456\u0435\u0432\u044A\",\n    \"Forename 1\": \"\u041F\u0435\u0442\u0440\
+  \u044A\",\n    \"Forename 2\": null,\n    \"Description\": \"\u0412\u044A 1863 \u0433\
+  . \u043F\u0435\u0440\u0435\u0432\u0435\u0434\u0435\u043D\u044A \u0432\u044A 1-\u044E\
+  \ \u041C\u043E\u0441\u043A. \u0432\u043E\u0435\u043D. \u0433\u0438\u043C\u0438.\"\
+  ,\n    \"Rank/title\": null,\n    \"Birth Year\": null,\n    \"Age\": null,\n  \
+  \  \"Where From\": null,\n    \"Department/faculty\": null,\n    \"Subject studied\"\
+  : null\n  },\n  {\n    \"URL\": \"https://runivers.ru/lib/book7701/439293/\",\n\
+  \    \"PDF\": \"aleksandrinski korpus.pdf\",\n    \"Image No\": \"93\",\n    \"\
+  Page No\": \"95\",\n    \"Year\": 1863,\n    \"Surname\": \"\u0410\u0432\u043E\u0440\
+  \u0438\u043D\u044A 1-\u0439\",\n    \"Forename 1\": \"\u0410\u043B\u0435\u043A\u0441\
+  \u0430\u043D\u0434\u0440\u044C\",\n    \"Forename 2\": null,\n    \"Description\"\
+  : \"\u0412\u044B\u0448\u0435\u043B\u044A \u0432\u044A \u041A\u0430\u0437\u0430\u043D\
+  \u0441\u043A\u0456\u0439 \u043F\u0463\u0445. \u043F\u043E\u043B\u0441\u0442\u044A\
+  .\",\n    \"Rank/title\": null,\n    \"Birth Year\": null,\n    \"Age\": null,\n\
+  \    \"Where From\": null,\n    \"Department/faculty\": null,\n    \"Subject studied\"\
+  : null\n  }\n]\n\nFor each entry in the document image, create a separate object\
+  \ in the JSON array following the EXACT format shown above. DO NOT combine multiple\
+  \ entries into a single object.\n\nYou are an expert data entry specialist for historical\
+  \ vital records. Your task is to accurately extract information from scanned images\
+  \ of Russian Students and format it as a JSON object.\n\nImportant instructions:\n\
+  1. Process ALL entries, not just one example.\n2. Return ONLY valid JSON without\
+  \ any surrounding explanation.\n3. The final response must be a JSON array containing\
+  \ ALL entries.\n4. Each array item must follow the schema exactly and match the\
+  \ format shown in the examples.\n5. If any field is missing in an entry, use null,\
+  \ unless it's a date field where partial illegibility rules apply (use '??').\n\
+  6. Preserve old Russian spelling and names.\n7. Ensure all nullable fields are null\
+  \ if absent, not empty strings unless the schema dictates otherwise.\n8. Output\
+  \ must be valid JSON that can be parsed with json.loads(). The output MUST start\
+  \ with '[' and end with ']'.\n9. For rows with ditto marks, look at the cell DIRECTLY\
+  \ above the current cell to find the value to copy.\n10. If the image has multiple\
+  \ columns, first complete the leftmost column, then proceed to the next column.\n\
+  11. The first record should be the first complete record found on the image, do\
+  \ not key partial records. For example, if the first writing on the image is from\
+  \ a record that started on the previous image, start on the next complete record.\n"
 schema:
   $schema: http://json-schema.org/draft-07/schema#
   title: Russian Student Entry
@@ -114,121 +108,140 @@ schema:
       description: The precise URL for a specific image online or within a PDF.
     Page No:
       type: string
-      description: The pagination, which may be at the top or foot of the original printed page. Capture wherever possible.
+      description: The pagination, which may be at the top or foot of the original
+        printed page. Capture wherever possible.
     Year:
       type: integer
-      description: The Year shown against/above/for a specific individual, not the year of publication. Can be rolled down in chronological lists.
+      description: The Year shown against/above/for a specific individual, not the
+        year of publication. Can be rolled down in chronological lists.
     Surname:
       type: string
-      description: The surname of the student. Usually precedes forenames, may be hyphenated, sometimes in bolder type or larger font.
+      description: The surname of the student. Usually precedes forenames, may be
+        hyphenated, sometimes in bolder type or larger font.
     Forename 1:
       type: string
-      description: The true given name of the student. Usually separated from the preceding Surname by a comma. Can be abbreviated.
+      description: The true given name of the student. Usually separated from the
+        preceding Surname by a comma. Can be abbreviated.
     Forename 2:
       type:
-        - string
-        - 'null'
-      description: The patronymic middle name (Отчество = otchestvo). Can be null if not known or not given due to space. Can be abbreviated.
+      - string
+      - 'null'
+      description: "The patronymic middle name (\u041E\u0442\u0447\u0435\u0441\u0442\
+        \u0432\u043E = otchestvo). Can be null if not known or not given due to space.\
+        \ Can be abbreviated."
     Description:
       type: string
-      description: A general field to place all other text that cannot be easily extracted into more specific fields.
+      description: A general field to place all other text that cannot be easily extracted
+        into more specific fields.
     Rank/title:
       type:
-        - string
-        - 'null'
-      description: Intended for prefixed military ranks or noble titles where given. Can be null if not present.
+      - string
+      - 'null'
+      description: Intended for prefixed military ranks or noble titles where given.
+        Can be null if not present.
     Birth Year:
       type:
-        - integer
-        - 'null'
-      description: The birth year of the student, might be preceded by 'Род.' or 'Р.'. Can be null if not present.
+      - integer
+      - 'null'
+      description: "The birth year of the student, might be preceded by '\u0420\u043E\
+        \u0434.' or '\u0420.'. Can be null if not present."
     Age:
       type:
-        - string
-        - 'null'
-      description: The age of the student, expected as a number followed by 'л.' or 'г.'. Can be null if not present.
+      - string
+      - 'null'
+      description: "The age of the student, expected as a number followed by '\u043B\
+        .' or '\u0433.'. Can be null if not present."
     Where From:
       type:
-        - string
-        - 'null'
-      description: The birth place or residence, usually a city/town/province name. May have a prefix like 'г.'. Can be null if not present.
+      - string
+      - 'null'
+      description: "The birth place or residence, usually a city/town/province name.\
+        \ May have a prefix like '\u0433.'. Can be null if not present."
     Department/faculty:
       type:
-        - string
-        - 'null'
-      description: The department or faculty in larger institutions like universities. Can be null if not present or not applicable.
+      - string
+      - 'null'
+      description: The department or faculty in larger institutions like universities.
+        Can be null if not present or not applicable.
     Subject studied:
       type:
-        - string
-        - 'null'
-      description: The specific area of study for graduating students in university lists. Can be null if not present or not applicable.
+      - string
+      - 'null'
+      description: The specific area of study for graduating students in university
+        lists. Can be null if not present or not applicable.
   required:
-    - URL
-    - PDF
-    - Image No
-    - Page No
-    - Year
-    - Surname
-    - Forename 1
-    - Forename 2
-    - Description
-    - Rank/title
-    - Birth Year
-    - Age
-    - Where From
-    - Department/faculty
-    - Subject studied
+  - URL
+  - PDF
+  - Image No
+  - Page No
+  - Year
+  - Surname
+  - Forename 1
+  - Forename 2
+  - Description
+  - Rank/title
+  - Birth Year
+  - Age
+  - Where From
+  - Department/faculty
+  - Subject studied
   additionalProperties: false
 examples:
-  - images: []
-    expected:
-      URL: https://runivers.ru/lib/book7701/439293/
-      PDF: aleksandrinski korpus.pdf
-      Image No: '93'
-      Page No: '95'
-      Year: null
-      Surname: Абакановичъ
-      Forename 1: Михаиль
-      Forename 2: null
-      Description: Въ 1863 г. переведенъ во 2-ю Моск. воен. гими.
-      Rank/title: null
-      Birth Year: null
-      Age: null
-      Where From: null
-      Department/faculty: null
-      Subject studied: null
-  - images: []
-    expected:
-      URL: https://runivers.ru/lib/book7701/439293/
-      PDF: aleksandrinski korpus.pdf
-      Image No: '93'
-      Page No: '95'
-      Year: null
-      Surname: Аверкіевъ
-      Forename 1: Петръ
-      Forename 2: null
-      Description: Въ 1863 г. переведенъ въ 1-ю Моск. воен. гими.
-      Rank/title: null
-      Birth Year: null
-      Age: null
-      Where From: null
-      Department/faculty: null
-      Subject studied: null
-  - images: []
-    expected:
-      URL: https://runivers.ru/lib/book7701/439293/
-      PDF: aleksandrinski korpus.pdf
-      Image No: '93'
-      Page No: '95'
-      Year: 1863
-      Surname: Аворинъ 1-й
-      Forename 1: Александрь
-      Forename 2: null
-      Description: Вышелъ въ Казанскій пѣх. полстъ.
-      Rank/title: null
-      Birth Year: null
-      Age: null
-      Where From: null
-      Department/faculty: null
-      Subject studied: null
+- images: []
+  expected:
+    URL: https://runivers.ru/lib/book7701/439293/
+    PDF: aleksandrinski korpus.pdf
+    Image No: '93'
+    Page No: '95'
+    Year: null
+    Surname: "\u0410\u0431\u0430\u043A\u0430\u043D\u043E\u0432\u0438\u0447\u044A"
+    Forename 1: "\u041C\u0438\u0445\u0430\u0438\u043B\u044C"
+    Forename 2: null
+    Description: "\u0412\u044A 1863 \u0433. \u043F\u0435\u0440\u0435\u0432\u0435\u0434\
+      \u0435\u043D\u044A \u0432\u043E 2-\u044E \u041C\u043E\u0441\u043A. \u0432\u043E\
+      \u0435\u043D. \u0433\u0438\u043C\u0438."
+    Rank/title: null
+    Birth Year: null
+    Age: null
+    Where From: null
+    Department/faculty: null
+    Subject studied: null
+- images: []
+  expected:
+    URL: https://runivers.ru/lib/book7701/439293/
+    PDF: aleksandrinski korpus.pdf
+    Image No: '93'
+    Page No: '95'
+    Year: null
+    Surname: "\u0410\u0432\u0435\u0440\u043A\u0456\u0435\u0432\u044A"
+    Forename 1: "\u041F\u0435\u0442\u0440\u044A"
+    Forename 2: null
+    Description: "\u0412\u044A 1863 \u0433. \u043F\u0435\u0440\u0435\u0432\u0435\u0434\
+      \u0435\u043D\u044A \u0432\u044A 1-\u044E \u041C\u043E\u0441\u043A. \u0432\u043E\
+      \u0435\u043D. \u0433\u0438\u043C\u0438."
+    Rank/title: null
+    Birth Year: null
+    Age: null
+    Where From: null
+    Department/faculty: null
+    Subject studied: null
+- images: []
+  expected:
+    URL: https://runivers.ru/lib/book7701/439293/
+    PDF: aleksandrinski korpus.pdf
+    Image No: '93'
+    Page No: '95'
+    Year: 1863
+    Surname: "\u0410\u0432\u043E\u0440\u0438\u043D\u044A 1-\u0439"
+    Forename 1: "\u0410\u043B\u0435\u043A\u0441\u0430\u043D\u0434\u0440\u044C"
+    Forename 2: null
+    Description: "\u0412\u044B\u0448\u0435\u043B\u044A \u0432\u044A \u041A\u0430\u0437\
+      \u0430\u043D\u0441\u043A\u0456\u0439 \u043F\u0463\u0445. \u043F\u043E\u043B\u0441\
+      \u0442\u044A."
+    Rank/title: null
+    Birth Year: null
+    Age: null
+    Where From: null
+    Department/faculty: null
+    Subject studied: null
 version_tag: v1

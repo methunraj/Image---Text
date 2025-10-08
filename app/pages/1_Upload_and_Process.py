@@ -27,6 +27,7 @@ from app.core.model_registry import ModelRegistryError, ModelDescriptor, ensure_
 from app.core.provider_openai import gateway_from_descriptor
 from app.core.templating import RenderedMessages, render_user_prompt
 from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes, to_xlsx_bytes
+from app.core.checkpoints import FolderCheckpoint
 
 
 UPLOAD_DIR = Path("data/uploads")
@@ -58,9 +59,9 @@ def _build_model_context(descriptor: ModelDescriptor) -> ModelContext:
         }
     }
     if pricing_cfg.cache_read_per_1k is not None:
-        pricing["pricing"]["cache_read"] = pricing_cfg.cache_read_per_1k
+        pricing["pricing"]["cache_read_per_1k"] = pricing_cfg.cache_read_per_1k
     if pricing_cfg.cache_write_per_1k is not None:
-        pricing["pricing"]["cache_write"] = pricing_cfg.cache_write_per_1k
+        pricing["pricing"]["cache_write_per_1k"] = pricing_cfg.cache_write_per_1k
     pricing["pricing"]["input_per_million"] = pricing_cfg.input_per_million
     pricing["pricing"]["output_per_million"] = pricing_cfg.output_per_million
     pricing["pricing"]["cache_read_per_million"] = pricing_cfg.cache_read_per_million
@@ -363,9 +364,9 @@ def run() -> None:
 
     src_choice = st.radio(
         "Source",
-        options=["Upload files", "Select folder"],
+        options=["Upload files", "Select folder", "Upload PDF"],
         horizontal=True,
-        help="Upload individual images or add an entire folder"
+        help="Upload individual images, add an entire folder, or convert PDFs to images"
     )
 
     if src_choice == "Upload files":
@@ -387,7 +388,7 @@ def run() -> None:
                     selected_lst.append(pth)
             if saved_paths:
                 st.success(f"✅ Uploaded {len(saved_paths)} file(s)")
-    else:
+    elif src_choice == "Select folder":
         col_f1, col_f2 = st.columns([3, 1])
         with col_f1:
             default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
@@ -411,18 +412,83 @@ def run() -> None:
             add_all = st.button("Add Folder")
         with col_b2:
             preview = st.button("Preview")
-        if preview and folder_ok:
-            imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
+
+        # Compute images and checkpoint info when folder is OK
+        imgs_found: List[str] = []
+        cp: FolderCheckpoint | None = None
+        if folder_ok:
+            folder_abs = Path(_normalize_folder_input(folder_path)).resolve()
+            imgs_found = _find_images_in_folder(folder_abs, recursive)
+            # Load or initialize checkpoint
+            cp = FolderCheckpoint(folder_abs)
+            cp.load()
             if imgs_found:
-                st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
+                cp.ensure_entries(imgs_found)
+                cp.prune_missing()
+                try:
+                    cp.save()
+                except Exception:
+                    pass
+
+        if preview and folder_ok:
+            if imgs_found:
+                if cp:
+                    stats = cp.get_stats_for(imgs_found)
+                    st.info(f"Found {stats['total']} image(s) • {stats['processed']} processed • {stats['failed']} failed • {stats['pending']} pending")
+                else:
+                    st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
             else:
                 st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
+
+        # Resume/Retry/Reset controls when a checkpoint is available
+        if folder_ok and imgs_found and cp is not None:
+            st.markdown("#### Checkpoint")
+            r1, r2, r3 = st.columns([1.2, 1.2, 1])
+            with r1:
+                resume = st.button("Resume pending", key="resume_pending")
+            with r2:
+                retry_failed = st.button("Retry failed only", key="retry_failed")
+            with r3:
+                reset_cp = st.button("Reset checkpoint", key="reset_checkpoint")
+
+            if reset_cp:
+                cp.reset()
+                cp.save()
+                st.success("Checkpoint reset: all files marked pending")
+
+            if resume:
+                pending = cp.pending_files(imgs_found)
+                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                added = 0
+                for p in pending:
+                    if p not in lst:
+                        lst.append(p)
+                        added += 1
+                    if p not in selected_lst:
+                        selected_lst.append(p)
+                st.session_state["last_folder_path"] = folder_path
+                st.success(f"✅ Added {added} pending image(s)")
+
+            if retry_failed:
+                failed = cp.failed_files(imgs_found)
+                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                added = 0
+                for p in failed:
+                    if p not in lst:
+                        lst.append(p)
+                        added += 1
+                    if p not in selected_lst:
+                        selected_lst.append(p)
+                st.session_state["last_folder_path"] = folder_path
+                st.success(f"✅ Added {added} failed image(s)")
+
         if add_all:
             if not folder_ok:
                 st.error("Folder does not exist or is not accessible.")
             else:
                 st.session_state["last_folder_path"] = folder_path
-                imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
                 if not imgs_found:
                     st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
                 else:
@@ -436,6 +502,122 @@ def run() -> None:
                         if p not in selected_lst:
                             selected_lst.append(p)
                     st.success(f"✅ Added {added} image(s) from folder")
+    elif src_choice == "Upload PDF":
+        # PDF conversion UI
+        from app.core.pdf_convert import is_available as pdf_available, convert_pdf_to_images
+        st.caption("Convert PDF pages to images and save them to a folder")
+        pdfs = st.file_uploader("Select PDF(s)", type=["pdf"], accept_multiple_files=True)
+        default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
+        out_folder = st.text_input("Output folder", value=st.session_state.get("pdf_out_folder", default_dir), help="Pages will be saved here as images")
+        c1, c2, c3 = st.columns([1,1,2])
+        with c1:
+            dpi = st.number_input("DPI", min_value=72, max_value=600, value=200, step=10)
+        with c2:
+            fmt = st.selectbox("Format", options=["PNG", "JPEG"], index=0)
+        with c3:
+            overwrite = st.checkbox("Overwrite existing", value=False)
+        page_spec = st.text_input("Pages (optional)", placeholder="e.g., 1-5,8")
+        b1, b2 = st.columns([1,1])
+        with b1:
+            convert_only = st.button("Convert Pages")
+        with b2:
+            convert_and_queue = st.button("Convert & Queue")
+
+        if (convert_only or convert_and_queue):
+            # Validate
+            if not pdf_available():
+                st.error("pypdfium2 not installed. Please run: pip install -r requirements.txt")
+            elif not pdfs:
+                st.error("Please select at least one PDF.")
+            else:
+                try:
+                    out_dir = Path(_normalize_folder_input(out_folder)).resolve()
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    st.error(f"Cannot use output folder: {e}")
+                else:
+                    created_total, skipped_total, errors_total = 0, 0, 0
+                    created_paths: List[str] = []
+                    skipped_paths: List[str] = []
+                    # Save PDFs to temp and convert
+                    tmp_root = Path("data/uploads/pdf_tmp")
+                    tmp_root.mkdir(parents=True, exist_ok=True)
+                    for f in pdfs:
+                        try:
+                            tmp_path = tmp_root / _sanitize_filename(f.name)
+                            tmp_path.write_bytes(f.read())
+                            new, skipped, errs = convert_pdf_to_images(tmp_path, out_dir, dpi=dpi, fmt=fmt, overwrite=overwrite, page_spec=page_spec.strip() or None)
+                            created_total += len(new)
+                            skipped_total += len(skipped)
+                            errors_total += len(errs)
+                            created_paths.extend(new)
+                            skipped_paths.extend(skipped)
+                        except Exception as e:
+                            st.warning(f"{f.name}: {e}")
+                    # Update checkpoint for the folder
+                    cp = FolderCheckpoint(out_dir)
+                    cp.load()
+                    # Ensure entries for all images in the folder (created + skipped)
+                    imgs_in_folder = _find_images_in_folder(out_dir, True)
+                    cp.ensure_entries(imgs_in_folder)
+                    try:
+                        cp.save()
+                    except Exception:
+                        pass
+                    st.session_state["last_folder_path"] = str(out_dir)
+                    st.session_state["pdf_out_folder"] = str(out_dir)
+                    st.success(f"Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
+
+                    # If queue requested, add pending files from the output folder
+                    if convert_and_queue:
+                        pending = cp.pending_files(imgs_in_folder)
+                        lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                        selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                        added = 0
+                        for p in pending:
+                            if p not in lst:
+                                lst.append(p)
+                                added += 1
+                            if p not in selected_lst:
+                                selected_lst.append(p)
+                        st.info(f"Queued {added} pending page image(s)")
+                    # Quick checkpoint actions
+                    with st.expander("Checkpoint actions"):
+                        cpa1, cpa2, cpa3 = st.columns([1.2, 1.2, 1])
+                        with cpa1:
+                            if st.button("Resume pending", key="pdf_resume_pending"):
+                                pending = cp.pending_files(imgs_in_folder)
+                                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                                added = 0
+                                for p in pending:
+                                    if p not in lst:
+                                        lst.append(p)
+                                        added += 1
+                                    if p not in selected_lst:
+                                        selected_lst.append(p)
+                                st.success(f"✅ Added {added} pending page(s)")
+                        with cpa2:
+                            if st.button("Retry failed only", key="pdf_retry_failed"):
+                                failed = cp.failed_files(imgs_in_folder)
+                                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                                added = 0
+                                for p in failed:
+                                    if p not in lst:
+                                        lst.append(p)
+                                        added += 1
+                                    if p not in selected_lst:
+                                        selected_lst.append(p)
+                                st.success(f"✅ Added {added} failed page(s)")
+                        with cpa3:
+                            if st.button("Reset checkpoint", key="pdf_reset_cp"):
+                                cp.reset()
+                                try:
+                                    cp.save()
+                                except Exception:
+                                    pass
+                                st.warning("Checkpoint reset for output folder")
     
     # Image Management (Simple List)
     imgs: List[str] = st.session_state.get("uploaded_images", [])
@@ -576,24 +758,69 @@ def run() -> None:
 
     descriptor = model_ctx.descriptor
 
-    # Template selection
-    templates = storage.list_templates()
-    if not templates:
-        st.warning("⚠️ No templates configured")
-        if st.button("Create Template"):
-            st.switch_page("pages/2_Settings.py")
-        return
-    
-    template_names = [t.name for t in templates]
-    selected_template_name = st.selectbox(
-        "Select Template",
-        options=template_names,
-        help="Choose a template to extract data from images"
+    # Output format selection (replaces single 'Unstructured' toggle)
+    st.markdown("#### Output Format")
+    output_mode = st.radio(
+        "Choose output format",
+        options=["Structured (Template)", "Structured (Auto JSON)", "Unstructured (Markdown)"],
+        help="Use a saved template (schema + prompts), or let the model infer JSON without a schema, or get raw Markdown.",
+        horizontal=True,
+        key="output_mode_radio",
     )
+    auto_json = output_mode == "Structured (Auto JSON)"
+    unstructured = output_mode == "Unstructured (Markdown)"
+
+    # Template selection
+    selected_template = None
+    selected_template_name = None
+    if not auto_json and not unstructured:
+        templates = storage.list_templates()
+        if not templates:
+            st.warning("⚠️ No templates configured")
+            if st.button("Create Template"):
+                st.switch_page("pages/2_Settings.py")
+            return
+        
+        template_names = [t.name for t in templates]
+        selected_template_name = st.selectbox(
+            "Select Template",
+            options=template_names,
+            help="Choose a template to extract data from images"
+        )
+        
+        selected_template = next((t for t in templates if t.name == selected_template_name), None)
+
+    # Synthetic template for Auto JSON / Unstructured
+    if auto_json:
+        from types import SimpleNamespace
+        selected_template_name = "Auto JSON"
+        selected_template = SimpleNamespace(
+            id=None,
+            name=selected_template_name,
+            system_prompt=(
+                "You are a precise JSON generator. Analyze the image and output ONLY valid JSON. "
+                "Capture fields present in the document with reasonable keys. Use numbers for numeric values, "
+                "use arrays where multiple items are present, and nest objects as needed. Do not include code fences or explanations."
+            ),
+            user_prompt=(
+                "Extract information from the image. Document type: {doc_type}. Locale: {locale}.\n"
+                "Today's date is {today}. Respond with a single JSON object (or array if multiple entries). "
+                "Return JSON ONLY."
+            ),
+            schema_json=None,
+        )
+    elif unstructured and selected_template is None:
+        from types import SimpleNamespace
+        selected_template_name = "Unstructured"
+        selected_template = SimpleNamespace(
+            id=None,
+            name=selected_template_name,
+            system_prompt="",
+            user_prompt="",
+            schema_json=None,
+        )
     
-    selected_template = next((t for t in templates if t.name == selected_template_name), None)
-    
-    if selected_template:
+    if selected_template and not auto_json and not unstructured:
         # Show template info
         with st.expander("Template Details"):
             st.write(f"**Description:** {selected_template.description or 'No description'}")
@@ -614,6 +841,16 @@ def run() -> None:
             in_display = f"${per_million_in:.4f}" if per_million_in is not None else "—"
             out_display = f"${per_million_out:.4f}" if per_million_out is not None else "—"
             st.write(f"**Price (input/output per 1M):** {in_display} / {out_display}")
+        # Show INR per 1M if exchange rate available
+        try:
+            from app.core.currency import get_usd_to_inr
+            rate = get_usd_to_inr()
+            if rate and (per_million_in is not None or per_million_out is not None):
+                in_inr = f"₹{(per_million_in * rate):.2f}" if per_million_in is not None else "—"
+                out_inr = f"₹{(per_million_out * rate):.2f}" if per_million_out is not None else "—"
+                st.write(f"**Price (INR per 1M):** {in_inr} / {out_inr}  ")
+        except Exception:
+            pass
         reasoning_provider = model_ctx.reasoning.get("provider")
         if reasoning_provider:
             reason_parts = [reasoning_provider]
@@ -625,8 +862,8 @@ def run() -> None:
     # Output mode toggle and Process button
     col1, col2, col3, col4 = st.columns([1.2, 1.4, 3.4, 1])
     with col1:
-        # Minimal, per-run toggle to avoid DB/schema changes
-        unstructured = st.checkbox("Unstructured", help="Skip schema; return plain text/Markdown.")
+        # Reflect selected output format (disabled, driven by radio above)
+        st.checkbox("Unstructured", value=unstructured, help="Skip schema; return plain text/Markdown.", disabled=True)
     with col2:
         per_file_mode = st.checkbox("Per-file save", help="Process each file separately and auto-save next to inputs")
     with col3:
@@ -673,6 +910,23 @@ def run() -> None:
         saved_counts = {"json": 0, "md": 0, "docx": 0}
         errors: List[str] = []
         st.session_state['per_file_mode_active'] = True
+        # Prepare checkpoint if last_folder_path set
+        checkpoint: FolderCheckpoint | None = None
+        base_folder_raw = st.session_state.get("last_folder_path")
+        if base_folder_raw:
+            try:
+                base_folder = Path(_normalize_folder_input(base_folder_raw)).resolve()
+                checkpoint = FolderCheckpoint(base_folder)
+                checkpoint.load()
+                # record run context
+                try:
+                    checkpoint.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                    checkpoint.save()
+                except Exception:
+                    pass
+            except Exception:
+                checkpoint = None
+
         for idx, img_path in enumerate(selected, start=1):
             try:
                 per_file_gateway = gateway_from_descriptor(descriptor)
@@ -693,6 +947,8 @@ def run() -> None:
                 base_name = _guess_original_stem(in_path)
                 if not out:
                     errors.append(f"No output for {in_path.name}")
+                    if checkpoint is not None:
+                        checkpoint.mark_failed(img_path, "No output")
                 else:
                     if unstructured and isinstance(out, dict) and 'raw_text' in out:
                         text = str(out.get('raw_text') or "")
@@ -701,6 +957,8 @@ def run() -> None:
                         (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
                         recs = ensure_records({"raw_text": text})
                         (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                        if checkpoint is not None:
+                            checkpoint.mark_processed(img_path, {"json": str(out_dir / f"{base_name}.json"), "md": str(out_dir / f"{base_name}.md"), "docx": str(out_dir / f"{base_name}.docx")})
                         saved_counts['md'] += 1
                         saved_counts['docx'] += 1
                         saved_counts['json'] += 1
@@ -710,13 +968,22 @@ def run() -> None:
                         (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
                         (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
                         (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
+                        if checkpoint is not None:
+                            checkpoint.mark_processed(img_path, {"json": str(out_dir / f"{base_name}.json"), "md": str(out_dir / f"{base_name}.md"), "docx": str(out_dir / f"{base_name}.docx")})
                         saved_counts['json'] += 1
                         saved_counts['md'] += 1
                         saved_counts['docx'] += 1
             except Exception as e:
                 errors.append(f"Save failed for {Path(img_path).name}: {e}")
+                if checkpoint is not None:
+                    checkpoint.mark_failed(img_path, str(e))
             finally:
                 progress.progress(idx/total, text=f"Processing {idx}/{total}")
+                if checkpoint is not None:
+                    try:
+                        checkpoint.save()
+                    except Exception:
+                        pass
         progress.empty()
         st.success(f"Saved: {saved_counts['json']} JSON, {saved_counts['md']} MD, {saved_counts['docx']} DOCX next to inputs")
         if errors:
@@ -739,6 +1006,17 @@ def run() -> None:
             if unstructured:
                 gateway.prefer_json_mode = False
                 gateway.prefer_tools = False
+            # Update checkpoint run context if folder-based
+            base_folder_raw2 = st.session_state.get("last_folder_path")
+            if base_folder_raw2:
+                try:
+                    base_folder = Path(_normalize_folder_input(base_folder_raw2)).resolve()
+                    checkpoint2 = FolderCheckpoint(base_folder)
+                    checkpoint2.load()
+                    checkpoint2.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                    checkpoint2.save()
+                except Exception:
+                    pass
             result = _process_images(
                 model_ctx,
                 gateway,
@@ -750,7 +1028,7 @@ def run() -> None:
         
         # Store result in session state for persistence
         st.session_state['last_result'] = result
-        st.session_state['last_template_name'] = selected_template_name
+        st.session_state['last_template_name'] = selected_template_name or ""
         st.session_state['last_images'] = selected.copy()
         st.session_state['processing_timestamp'] = time.time()
         st.session_state['last_unstructured'] = unstructured
@@ -1032,7 +1310,20 @@ def run() -> None:
                         cost_info = cost_from_usage(usage_data, model_ctx.pricing)
                         total_cost = cost_info.get("total_usd") if cost_info else None
                         if total_cost:
-                            st.write(f"**Estimated cost:** ${total_cost:.4f}")
+                            # USD + INR (if available)
+                            try:
+                                from app.core.currency import convert_usd_to_inr, get_usd_to_inr
+                                rate = get_usd_to_inr()
+                                if rate:
+                                    inr = convert_usd_to_inr(float(total_cost), rate=rate)
+                                    if inr is not None:
+                                        st.write(f"**Estimated cost:** ${float(total_cost):.4f} • ₹{inr:.2f} (USD→INR {rate})")
+                                    else:
+                                        st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
+                                else:
+                                    st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
+                            except Exception:
+                                st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
                             
                             # Track cumulative cost in session
                             if process_clicked:
@@ -1056,7 +1347,7 @@ def run() -> None:
                     
                     run = storage.record_run(
                         provider_id=model_ctx.provider_record.id,
-                        template_id=selected_template.id,
+                        template_id=(getattr(selected_template, 'id', None) or None),
                         input_images=selected,
                         output=result["output"],
                         cost_usd=cost_usd,

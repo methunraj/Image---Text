@@ -65,6 +65,10 @@ def _encrypt(kms: Optional[Fernet], plaintext: str) -> Optional[str]:
 def _decrypt(kms: Optional[Fernet], token: Optional[str]) -> Optional[str]:
     if not kms or not token:
         return None
+    try:
+        return kms.decrypt(token.encode()).decode()
+    except (InvalidToken, Exception):
+        return None
 
 
 def _get_api_key_for_provider_code(provider_code: str) -> Optional[str]:
@@ -100,10 +104,6 @@ def _set_api_key_for_provider_code(provider_code: str, key_storage: str, new_key
     enc = _encrypt(kms, new_key) if new_key else None
     storage.set_provider_key(code, "encrypted" if enc else "session", enc)
     return ("encrypted" if enc else "session"), enc
-    try:
-        return kms.decrypt(token.encode()).decode()
-    except (InvalidToken, Exception):
-        return None
 
 
 def _get_api_key_for_provider(pid: int, key_storage: str, enc: Optional[str]) -> Optional[str]:
@@ -930,7 +930,8 @@ def _custom_model_form() -> Optional[Dict[str, Any]]:
             st.rerun()
     
     # Add provider-specific guidance
-    with st.info("ℹ️ Provider-Specific Notes"):
+    st.info("ℹ️ Provider-Specific Notes")
+    with st.container(border=True):
         st.markdown("""
         **OpenRouter:** 
         - Use model IDs like `openai/gpt-4-vision-preview` or `anthropic/claude-3-opus`
@@ -1784,6 +1785,12 @@ def run() -> None:  # type: ignore[no-redef]
                     st.warning("No default model configured")
 
                 capabilities_rows: List[Dict[str, Any]] = []
+                # Optional INR rate for display
+                try:
+                    from app.core.currency import get_usd_to_inr
+                    _usd_to_inr_rate = get_usd_to_inr()
+                except Exception:
+                    _usd_to_inr_rate = None
                 for model in sorted(registry.models.values(), key=lambda m: (m.provider_label, m.label)):
                     if not model.show_in_ui:
                         continue
@@ -1796,6 +1803,16 @@ def run() -> None:  # type: ignore[no-redef]
                         if reasoning.effort_default:
                             parts.append(str(reasoning.effort_default))
                         reasoning_label = ", ".join(parts)
+                    # Prefer per million for display; derive from per_1k if needed
+                    in_per_m = pricing.input_per_million if pricing.input_per_million is not None else (pricing.input_per_1k * 1000.0 if pricing.input_per_1k is not None else None)
+                    out_per_m = pricing.output_per_million if pricing.output_per_million is not None else (pricing.output_per_1k * 1000.0 if pricing.output_per_1k is not None else None)
+                    # Optional INR
+                    def _fmt_usd(v):
+                        return f"{v:.4f}" if v is not None else "—"
+                    def _fmt_inr(v):
+                        return f"₹{v:.2f}" if v is not None else "—"
+                    in_inr = (in_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and in_per_m is not None) else None
+                    out_inr = (out_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and out_per_m is not None) else None
                     capabilities_rows.append(
                         {
                             "Provider": model.provider_label,
@@ -1807,14 +1824,9 @@ def run() -> None:  # type: ignore[no-redef]
                             "Streaming": "✅" if caps.streaming else "—",
                             "Context": f"{model.context_window:,}",
                             "Max Output": model.max_output_tokens or "∞",
-                            "Input $/1K": f"{pricing.input_per_1k:.4f}" if pricing.input_per_1k or pricing.input_per_1k == 0 else "—",
-                            "Output $/1K": f"{pricing.output_per_1k:.4f}" if pricing.output_per_1k or pricing.output_per_1k == 0 else "—",
-                            "Input $/1M": (
-                                f"{pricing.input_per_million:.4f}" if pricing.input_per_million is not None else "—"
-                            ),
-                            "Output $/1M": (
-                                f"{pricing.output_per_million:.4f}" if pricing.output_per_million is not None else "—"
-                            ),
+                            "Input $/1M": _fmt_usd(in_per_m),
+                            "Output $/1M": _fmt_usd(out_per_m),
+                            **({"Input ₹/1M": _fmt_inr(in_inr), "Output ₹/1M": _fmt_inr(out_inr)} if _usd_to_inr_rate else {}),
                             "Reasoning": reasoning_label,
                         }
                     )
@@ -1831,6 +1843,23 @@ def run() -> None:  # type: ignore[no-redef]
                     f"• Frontend temperature control: {'enabled' if policies.allow_frontend_temperature else 'disabled'}\n"
                     f"• Frontend model selection: {'enabled' if policies.allow_frontend_model_selection else 'disabled'}"
                 )
+
+                # Currency & Rates
+                with st.expander("Currency & Rates", expanded=False):
+                    st.caption("Set today's exchange rate to view INR estimates alongside USD.")
+                    from app.core.currency import load_rates, save_rates
+                    rates = load_rates()
+                    try:
+                        default_rate = float(rates.get("usd_to_inr", 0)) if rates.get("usd_to_inr") is not None else 0.0
+                    except Exception:
+                        default_rate = 0.0
+                    colr1, colr2 = st.columns([2,1])
+                    with colr1:
+                        usd_to_inr = st.number_input("USD → INR rate", min_value=0.0, max_value=1000.0, value=float(default_rate), step=0.1, help="Enter today's exchange rate (1 USD equals how many INR)")
+                    with colr2:
+                        if st.button("Save rate"):
+                            save_rates({"usd_to_inr": float(usd_to_inr) if usd_to_inr > 0 else None})
+                            st.success("Saved exchange rate")
 
     with tab_template:
         st.markdown("### Manage Templates")
