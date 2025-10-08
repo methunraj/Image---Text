@@ -568,21 +568,22 @@ def run() -> None:
                     st.session_state["pdf_out_folder"] = str(out_dir)
                     st.success(f"Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
 
-                    # If queue requested, add pending files from the output folder
-                    if convert_and_queue:
-                        pending = cp.pending_files(imgs_in_folder)
-                        lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-                        selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
-                        added = 0
-                        for p in pending:
-                            if p not in lst:
-                                lst.append(p)
-                                added += 1
-                            if p not in selected_lst:
-                                selected_lst.append(p)
-                        st.info(f"Queued {added} pending page image(s)")
-                        # Refresh UI to jump to Input Files section
-                        st.rerun()
+                    # Always queue pending files after conversion
+                    pending = cp.pending_files(imgs_in_folder)
+                    lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                    selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                    added = 0
+                    for p in pending:
+                        if p not in lst:
+                            lst.append(p)
+                            added += 1
+                        if p not in selected_lst:
+                            selected_lst.append(p)
+                    st.info(f"Queued {added} pending page image(s)")
+                    # Prefer per-file mode and trigger auto processing; refresh UI
+                    st.session_state['per_file_mode_default'] = True
+                    st.session_state['_auto_process_request'] = True
+                    st.rerun()
                     # Quick checkpoint actions
                     with st.expander("Checkpoint actions"):
                         cpa1, cpa2, cpa3 = st.columns([1.2, 1.2, 1])
@@ -869,13 +870,26 @@ def run() -> None:
         # Reflect selected output format (disabled, driven by radio above)
         st.checkbox("Unstructured", value=unstructured, help="Skip schema; return plain text/Markdown.", disabled=True)
     with col2:
-        per_file_mode = st.checkbox("Per-file save", help="Process each file separately and auto-save next to inputs")
+        per_file_mode = st.checkbox(
+            "Per-file save",
+            value=st.session_state.get('per_file_mode_default', False),
+            key='per_file_mode_checkbox',
+            help="Process each file separately and auto-save next to inputs",
+        )
+    # Allow auto-processing (e.g., after PDF conversion)
+    auto_process_flag = bool(st.session_state.get('_auto_process_request', False))
+    if auto_process_flag:
+        st.session_state['per_file_mode_default'] = True
+        per_file_mode = True
     with col3:
         process_clicked = st.button(
             f"▶️ Process {len(selected)} Image(s)",
             type="primary",
             width='stretch'
         )
+    process_clicked = bool(process_clicked or auto_process_flag)
+    if auto_process_flag:
+        st.session_state.pop('_auto_process_request', None)
     with col4:
         # Clear results button
         if 'last_result' in st.session_state:
