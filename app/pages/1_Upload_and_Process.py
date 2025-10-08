@@ -631,55 +631,30 @@ def run() -> None:
         st.info("No images uploaded yet. Upload some images to get started.")
         return
     
-    # Collapsible + pagination for large lists
+    # Collapsible wrapper only (no pagination)
     selected: List[str] = st.session_state.setdefault("selected_images", [])
     tags: Dict[str, Dict[str, str]] = st.session_state.setdefault("image_tags", {})
 
     default_expanded = len(imgs) <= 50
     with st.expander(f"Input Files ({len(imgs)})", expanded=default_expanded):
-        # Pagination controls for big folders
-        page_size = st.session_state.get("_imgs_page_size", 50)
-        page_size = st.selectbox("Page size", options=[25, 50, 100, 200], index=[25,50,100,200].index(page_size) if page_size in [25,50,100,200] else 1, key="imgs_page_size_select", help="How many rows to show in the list")
-        st.session_state["_imgs_page_size"] = page_size
-
-        total_pages = max(1, (len(imgs) + page_size - 1) // page_size)
-        page = st.session_state.get("_imgs_page", 1)
-        page = max(1, min(page, total_pages))
-
-        pc1, pc2, pc3 = st.columns([1, 1, 6])
-        with pc1:
-            if st.button("◀ Prev", disabled=(page <= 1)):
-                st.session_state["_imgs_page"] = max(1, page - 1)
-                st.rerun()
-        with pc2:
-            if st.button("Next ▶", disabled=(page >= total_pages)):
-                st.session_state["_imgs_page"] = min(total_pages, page + 1)
-                st.rerun()
-        with pc3:
-            st.caption(f"Page {page} of {total_pages} • Selected: {len(selected)} / {len(imgs)}")
-
-        start = (page - 1) * page_size
-        end = start + page_size
-        visible = imgs[start:end]
-
-        # Select all/none for visible subset
-        col1, col2, _ = st.columns([1, 1, 6])
+        # Select all/none buttons
+        col1, col2, col3 = st.columns([1, 1, 6])
         with col1:
-            if st.button("Select Visible"):
-                for p in visible:
-                    if p not in selected:
-                        selected.append(p)
+            if st.button("Select All"):
+                selected = imgs.copy()
                 st.session_state["selected_images"] = selected
                 st.rerun()
         with col2:
-            if st.button("Deselect Visible"):
-                selected = [p for p in selected if p not in set(visible)]
+            if st.button("Select None"):
+                selected = []
                 st.session_state["selected_images"] = selected
                 st.rerun()
+        with col3:
+            st.caption(f"Selected: {len(selected)} / {len(imgs)}")
 
-        # File list (visible subset only)
+        # File list (full list)
         with st.container(border=True):
-            for idx, pth in enumerate(visible):
+            for idx, pth in enumerate(imgs):
                 col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
                 
                 with col1:
