@@ -631,35 +631,34 @@ def run() -> None:
         st.info("No images uploaded yet. Upload some images to get started.")
         return
     
-    # Collapsible wrapper only (no pagination)
+    # Original simple list (no wrapper), keep compact controls
     selected: List[str] = st.session_state.setdefault("selected_images", [])
     tags: Dict[str, Dict[str, str]] = st.session_state.setdefault("image_tags", {})
 
-    default_expanded = len(imgs) <= 50
-    with st.expander(f"Input Files ({len(imgs)})", expanded=default_expanded):
-        # Select all/none buttons
-        col1, col2, col3 = st.columns([1, 1, 6])
-        with col1:
-            if st.button("Select All"):
-                selected = imgs.copy()
-                st.session_state["selected_images"] = selected
-                st.rerun()
-        with col2:
-            if st.button("Select None"):
-                selected = []
-                st.session_state["selected_images"] = selected
-                st.rerun()
-        with col3:
-            st.caption(f"Selected: {len(selected)} / {len(imgs)}")
+    st.markdown(f"### Input Files ({len(imgs)})")
 
-        # File list (full list)
-        with st.container(border=True):
-            for idx, pth in enumerate(imgs):
-                col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
-                
-                with col1:
-                    stable_key = f"sel_{hashlib.sha1(pth.encode('utf-8')).hexdigest()[:10]}"
-                    checked = st.checkbox(
+    # Select all/none buttons
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        if st.button("Select All"):
+            selected = imgs.copy()
+            st.session_state["selected_images"] = selected
+            st.rerun()
+    with col2:
+        if st.button("Select None"):
+            selected = []
+            st.session_state["selected_images"] = selected
+            st.rerun()
+    with col3:
+        st.write(f"Selected: {len(selected)} of {len(imgs)}")
+
+    with st.container(border=True):
+        for idx, pth in enumerate(imgs):
+            col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+            
+            with col1:
+                stable_key = f"sel_{hashlib.sha1(pth.encode('utf-8')).hexdigest()[:10]}"
+                checked = st.checkbox(
                     "Select",
                     value=(pth in selected),
                     key=stable_key,
@@ -682,8 +681,8 @@ def run() -> None:
                     st.text("-")
             
             with col4:
-                # Optional tags (popover to avoid nested expanders)
-                with st.popover("Tags"):
+                # Optional tags (collapsible per file)
+                with st.expander("Tags"):
                     t = tags.get(pth, {"doc_type": "", "locale": "en-US"})
                     t["doc_type"] = st.text_input(
                         "Type",
