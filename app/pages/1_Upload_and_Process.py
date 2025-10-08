@@ -707,19 +707,19 @@ def run() -> None:
                     st.text("-")
             
             with col4:
-                # Optional tags (collapsible)
-                with st.expander("Tags"):
+                # Optional tags (popover to avoid nested expanders)
+                with st.popover("Tags"):
                     t = tags.get(pth, {"doc_type": "", "locale": "en-US"})
                     t["doc_type"] = st.text_input(
-                        "Type", 
-                        value=t.get("doc_type", ""), 
+                        "Type",
+                        value=t.get("doc_type", ""),
                         key=f"doc_{idx}",
-                        placeholder="receipt, invoice, etc."
+                        placeholder="receipt, invoice, etc.",
                     )
                     t["locale"] = st.text_input(
-                        "Locale", 
-                        value=t.get("locale", "en-US"), 
-                        key=f"loc_{idx}"
+                        "Locale",
+                        value=t.get("locale", "en-US"),
+                        key=f"loc_{idx}",
                     )
                     tags[pth] = t
     
