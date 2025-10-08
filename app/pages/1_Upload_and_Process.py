@@ -568,22 +568,19 @@ def run() -> None:
                     st.session_state["pdf_out_folder"] = str(out_dir)
                     st.success(f"Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
 
-                    # Always queue pending files after conversion
-                    pending = cp.pending_files(imgs_in_folder)
-                    lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-                    selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
-                    added = 0
-                    for p in pending:
-                        if p not in lst:
-                            lst.append(p)
-                            added += 1
-                        if p not in selected_lst:
-                            selected_lst.append(p)
-                    st.info(f"Queued {added} pending page image(s)")
-                    # Prefer per-file mode and trigger auto processing; refresh UI
-                    st.session_state['per_file_mode_default'] = True
-                    st.session_state['_auto_process_request'] = True
-                    st.rerun()
+                    # Queue pending files only when requested
+                    if convert_and_queue:
+                        pending = cp.pending_files(imgs_in_folder)
+                        lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                        selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                        added = 0
+                        for p in pending:
+                            if p not in lst:
+                                lst.append(p)
+                                added += 1
+                            if p not in selected_lst:
+                                selected_lst.append(p)
+                        st.info(f"Queued {added} pending page image(s)")
                     # Quick checkpoint actions
                     with st.expander("Checkpoint actions"):
                         cpa1, cpa2, cpa3 = st.columns([1.2, 1.2, 1])
