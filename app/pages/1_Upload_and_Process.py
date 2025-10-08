@@ -885,7 +885,7 @@ def run() -> None:
         process_clicked = st.button(
             f"▶️ Process {len(selected)} Image(s)",
             type="primary",
-            width='stretch'
+            use_container_width=True,
         )
     process_clicked = bool(process_clicked or auto_process_flag)
     if auto_process_flag:

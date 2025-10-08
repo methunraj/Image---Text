@@ -1226,20 +1226,20 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
         with bcol1:
             test_clicked = st.button(
                 "🧪 Test Connection", 
-                width='stretch',
+                use_container_width=True,
                 type="primary",
                 disabled=not (api_key or local_no_key)
             )
         with bcol2:
             use_clicked = st.button(
                 "✅ Use Without Saving", 
-                width='stretch',
+                use_container_width=True,
                 disabled=not (api_key or local_no_key)
             )
         with bcol3:
             save_profile_clicked = st.button(
                 "💾 Save as Profile", 
-                width='stretch'
+                use_container_width=True
             )
             if save_profile_clicked:
                 st.session_state["show_save_form"] = True
@@ -1445,7 +1445,7 @@ def _template_management() -> None:
         st.markdown("#### Quick Start")
         col_starter, col_spacer = st.columns([1, 3])
         with col_starter:
-            if st.button("🚀 Starter: Generic Doc", width='stretch', type="primary"):
+            if st.button("🚀 Starter: Generic Doc", use_container_width=True, type="primary"):
                 try:
                     # Create the starter template
                     starter_schema = {
@@ -1646,11 +1646,11 @@ Respond ONLY with JSON."""
         # Allow saving even if schema is invalid when schema is not required
         require_schema = template_type == "Structured (Schema)"
         disable_save = (require_schema and not schema_valid) or not name.strip()
-        save_clicked = st.button("Save", width='stretch', disabled=disable_save)
+        save_clicked = st.button("Save", use_container_width=True, disabled=disable_save)
     with colB:
-        clone_clicked = st.button("Clone", width='stretch', disabled=is_new)
+        clone_clicked = st.button("Clone", use_container_width=True, disabled=is_new)
     with colC:
-        del_clicked = st.button("Delete", width='stretch', disabled=is_new)
+        del_clicked = st.button("Delete", use_container_width=True, disabled=is_new)
 
     if save_clicked:
         normalized_name = name.strip()
