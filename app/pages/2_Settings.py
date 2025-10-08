@@ -1869,7 +1869,8 @@ def run() -> None:  # type: ignore[no-redef]
                     )
 
                 if capabilities_rows:
-                    st.dataframe(capabilities_rows, width='stretch')
+                    # For dataframe, width expects an int in current Streamlit; keep container width behavior
+                    st.dataframe(capabilities_rows, use_container_width=True)
                 else:
                     st.info("No models flagged for UI in this profile.")
 
