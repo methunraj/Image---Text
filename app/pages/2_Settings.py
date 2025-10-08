@@ -1517,23 +1517,51 @@ Respond ONLY with JSON."""
         name = st.text_input("Name", value=("" if is_new else tpl.name))
         desc = st.text_input("Description (optional)", value=("" if is_new else (tpl.description or "")))
         
+        # Template type selector: allow creating non-schema templates easily
+        template_type = st.radio(
+            "Template Type",
+            options=["Structured (Schema)", "Structured (Auto JSON)", "Unstructured (Markdown)"],
+            horizontal=True,
+            help="Choose whether this template enforces a schema, guides the model to produce JSON without a schema, or captures unstructured text.",
+            key="tpl_type_radio",
+            index=(0 if not is_new and tpl and (tpl.schema_json or {}) else 0),
+        )
+        
         # Use tabs for better organization
         tab_prompts, tab_schema, tab_examples = st.tabs(["📝 Prompts", "🔧 Schema", "📚 Examples"])
         
         with tab_prompts:
+            # Defaults vary by template type when creating new templates
+            if is_new:
+                if template_type == "Structured (Schema)":
+                    default_system = "Return ONLY valid JSON matching the schema. No code fences. Use null for missing fields."
+                    default_user = (
+                        "You are a precise JSON generator. Use the schema to format results.\n{schema}\n\n{examples}\n"
+                        "Respond with only JSON."
+                    )
+                elif template_type == "Structured (Auto JSON)":
+                    default_system = (
+                        "You are a precise JSON generator. Analyze the image and output ONLY valid JSON.")
+                    default_user = (
+                        "Extract information from the image. Document type: {doc_type}. Locale: {locale}.\n"
+                        "Today's date is {today}. Respond with a single JSON object (or array if multiple entries). Return JSON ONLY."
+                    )
+                else:  # Unstructured
+                    default_system = ""
+                    default_user = "Describe the document and extract key information in Markdown."
+            else:
+                default_system = tpl.system_prompt or ""
+                default_user = tpl.user_prompt or ""
+
             system_prompt = st.text_area(
-                "System Prompt", 
-                value=("" if is_new else (tpl.system_prompt or "")), 
+                "System Prompt",
+                value=default_system,
                 height=120,
                 help="Instructions for the AI assistant"
             )
             user_prompt = st.text_area(
                 "User Prompt",
-                value=(
-                    "You are a precise JSON generator. Use the schema to format results.\n{schema}\n\n{examples}\nRespond with only JSON."
-                    if is_new
-                    else (tpl.user_prompt or "")
-                ),
+                value=default_user,
                 height=200,
                 help="Supports {schema}, {examples}, {today}, {locale}, {doc_type}",
             )
@@ -1562,11 +1590,13 @@ Respond ONLY with JSON."""
                 validation_message = f"❌ Schema JSON invalid: {str(e)[:100]}"
             
             # Show validation banner
-            if schema_text.strip():
+            if schema_text.strip() and template_type == "Structured (Schema)":
                 if schema_valid:
                     st.success(validation_message, icon="✅")
                 else:
                     st.error(validation_message, icon="❌")
+            elif template_type != "Structured (Schema)":
+                st.info("Schema is optional for this template type and will be ignored at runtime.")
 
         with tab_examples:
             st.markdown("Few-shot Examples (0–3)")
@@ -1613,7 +1643,10 @@ Respond ONLY with JSON."""
 
     colA, colB, colC = st.columns(3)
     with colA:
-        save_clicked = st.button("Save", use_container_width=True, disabled=not schema_valid or not name.strip())
+        # Allow saving even if schema is invalid when schema is not required
+        require_schema = template_type == "Structured (Schema)"
+        disable_save = (require_schema and not schema_valid) or not name.strip()
+        save_clicked = st.button("Save", use_container_width=True, disabled=disable_save)
     with colB:
         clone_clicked = st.button("Clone", use_container_width=True, disabled=is_new)
     with colC:
@@ -1626,6 +1659,10 @@ Respond ONLY with JSON."""
             return
 
         serialized_examples = [asdict(e) for e in examples]
+        # If schema is not required, ignore provided schema at runtime by storing empty {}
+        if template_type != "Structured (Schema)":
+            schema_obj = {} if not schema_obj else schema_obj  # ensure serializable
+
         body = {
             "name": normalized_name,
             "description": desc or None,
