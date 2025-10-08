@@ -581,6 +581,8 @@ def run() -> None:
                             if p not in selected_lst:
                                 selected_lst.append(p)
                         st.info(f"Queued {added} pending page image(s)")
+                        # Refresh UI to jump to Input Files section
+                        st.rerun()
                     # Quick checkpoint actions
                     with st.expander("Checkpoint actions"):
                         cpa1, cpa2, cpa3 = st.columns([1.2, 1.2, 1])
@@ -597,6 +599,7 @@ def run() -> None:
                                     if p not in selected_lst:
                                         selected_lst.append(p)
                                 st.success(f"✅ Added {added} pending page(s)")
+                                st.rerun()
                         with cpa2:
                             if st.button("Retry failed only", key="pdf_retry_failed"):
                                 failed = cp.failed_files(imgs_in_folder)
@@ -610,6 +613,7 @@ def run() -> None:
                                     if p not in selected_lst:
                                         selected_lst.append(p)
                                 st.success(f"✅ Added {added} failed page(s)")
+                                st.rerun()
                         with cpa3:
                             if st.button("Reset checkpoint", key="pdf_reset_cp"):
                                 cp.reset()
@@ -870,7 +874,7 @@ def run() -> None:
         process_clicked = st.button(
             f"▶️ Process {len(selected)} Image(s)",
             type="primary",
-            use_container_width=True
+            width='stretch'
         )
     with col4:
         # Clear results button

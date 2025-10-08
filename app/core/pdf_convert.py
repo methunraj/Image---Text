@@ -106,10 +106,10 @@ def convert_pdf_to_images(
                 skipped.append(str(target))
                 continue
             if fmt.upper() == "JPEG":
-                # Convert mode if needed
-                if pil.mode in ("RGBA", "P"):
+                # Convert to RGB for JPEG compatibility
+                if pil.mode != "RGB":
                     pil = pil.convert("RGB")
-                pil.save(str(target), format="JPEG", quality=90)
+                pil.save(str(target), format="JPEG", quality=90, optimize=True)
             else:
                 pil.save(str(target), format=fmt.upper())
             created.append(str(target))
