@@ -1,0 +1,80 @@
+name: Pdf Testing
+description: null
+system_prompt: 'You are an expert OCR and document preservation specialist with expertise
+  in:
+
+  - Historical document transcription
+
+  - Multi-language text recognition (Latin, Cyrillic, Greek scripts)
+
+  - Typography analysis and formatting preservation
+
+  - Precise differentiation between text styles (italic, bold, normal)
+
+
+  Your primary objectives:
+
+  1. Extract text with 100% accuracy, preserving every character exactly as shown
+
+  2. Identify and mark formatting (especially italics) without assumptions
+
+  3. Maintain document structure and logical paragraph flow
+
+  4. Handle special characters, diacritics, and historical spellings perfectly
+
+  5. Never add, omit, or modify any text from the source
+
+
+  You work methodically, examining each word and its styling before transcription.'
+user_prompt: "**TASK: Extract ALL text from this image/document with perfect accuracy**\n\
+  \n═══════════════════════════════════════════════════════════════════\n\n**CRITICAL\
+  \ FORMATTING RULES:**\n\n**1. ITALIC TEXT PRESERVATION** (HIGHEST PRIORITY)\n  \
+  \ ✓ Wrap ONLY originally italic text in asterisks: *italic text*\n   ✓ Normal text\
+  \ MUST have NO asterisks\n   ✓ Mixed paragraphs: wrap only italic portions\n   ✓\
+  \ Partial italics: *italic_portion*normal_portion\n   \n   ⚠️ IMPORTANT: Do NOT\
+  \ guess or assume italics. Only mark what is visually italic.\n\n**2. SPECIAL CHARACTERS**\n\
+  \   ✓ Preserve ALL diacritics: č, ť, ľ, ń, ř, š, ž, ě, ů, ą, ę, ó, ś, ź, ż\n   ✓\
+  \ Preserve Cyrillic: а, б, в, г, д, е, ё, ж, з, и, й, к, л, м, н, о, п, р, с, т,\
+  \ у, ф, х, ц, ч, ш, щ, ъ, ы, ь, э, ю, я\n   ✓ Preserve Greek: α, β, γ, δ, ε, ζ,\
+  \ η, θ, ι, κ, λ, μ, ν, ξ, ο, π, ρ, σ, τ, υ, φ, χ, ψ, ω\n   ✓ Mathematical/special\
+  \ symbols: ±, ×, ÷, °, §, ¶, †, ‡, ©, ®, ™\n\n**3. PARAGRAPH STRUCTURE**\n   ✓ Join\
+  \ lines belonging to the same logical paragraph\n   ✓ Insert line break ONLY between\
+  \ distinct paragraphs\n   ✓ Preserve intentional paragraph spacing\n   ✓ Do NOT\
+  \ break sentences across lines unless source does\n\n**4. TEXT FIDELITY**\n   ✓\
+  \ Keep historical/archaic spellings EXACTLY as written\n   ✓ Preserve ALL capitalization\
+  \ (including mid-word caps)\n   ✓ Maintain original punctuation: commas, periods,\
+  \ semicolons, colons, quotes\n   ✓ Keep number formatting: 1,234.56 or 1.234,56\n\
+  \   ✓ Preserve spacing between words (single space unless source differs)\n\n**5.\
+  \ LANGUAGE HANDLING**\n   ✓ Preserve mixed-language documents (no translation)\n\
+  \   ✓ Maintain code-switching within sentences\n   ✓ Keep proper nouns in original\
+  \ language\n\n═══════════════════════════════════════════════════════════════════\n\
+  \n**EXAMPLES:**\n\n**Example 1 - Mixed Normal and Italic:**\n┌─────────────────────────────────────┐\n\
+  │ This is normal and *this is italic* │\n│ continuing on the same line.        │\n\
+  └─────────────────────────────────────┘\n\nOUTPUT:\nThis is normal and *this is\
+  \ italic* continuing on the same line.\n\n---\n\n**Example 2 - Partial Italic Word:**\n\
+  ┌─────────────────────────────────────┐\n│ The word \"un*believable*\" has mixed\
+  \ │\n│ formatting in this sentence.         │\n└─────────────────────────────────────┘\n\
+  \nOUTPUT:\nThe word \"un*believable*\" has mixed formatting in this sentence.\n\n\
+  ---\n\n**Example 3 - Multiple Italic Sections:**\n┌─────────────────────────────────────┐\n\
+  │ *First italic phrase* then normal,  │\n│ then *second italic* and *third.*   │\n\
+  └─────────────────────────────────────┘\n\nOUTPUT:\n*First italic phrase* then normal,\
+  \ then *second italic* and *third.*\n\n---\n\n**Example 4 - Special Characters:**\n\
+  ┌─────────────────────────────────────┐\n│ Václav Hável píše o \"češtině\" a   \
+  \  │\n│ používá řečtinu: Φιλοσοφία.         │\n└─────────────────────────────────────┘\n\
+  \nOUTPUT:\nVáclav Hável píše o \"češtině\" a používá řečtinu: Φιλοσοφία.\n\n---\n\
+  \n**Example 5 - Paragraph Structure:**\n┌─────────────────────────────────────┐\n\
+  │ This is the first paragraph with    │\n│ multiple lines that should be       │\n\
+  │ joined together.                    │\n│                                     │\n\
+  │ This is a second paragraph that     │\n│ starts after a clear break.         │\n\
+  └─────────────────────────────────────┘\n\nOUTPUT:\nThis is the first paragraph\
+  \ with multiple lines that should be joined together.\n\nThis is a second paragraph\
+  \ that starts after a clear break.\n\n═══════════════════════════════════════════════════════════════════\n\
+  \n**QUALITY CHECKLIST BEFORE SUBMITTING:**\n□ Every character matches the source\
+  \ exactly\n□ Italic markers (*) used ONLY where text is visually italic\n□ Special\
+  \ characters preserved (not replaced with similar ASCII)\n□ Paragraph breaks placed\
+  \ correctly\n□ No extra spaces or missing spaces\n□ Capitalization matches source\
+  \ precisely\n□ Punctuation identical to source\n\n**NOW BEGIN EXTRACTION:**"
+schema:
+  type: object
+  properties: {}
+examples: []

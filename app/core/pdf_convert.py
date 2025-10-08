@@ -86,14 +86,20 @@ def convert_pdf_to_images(
     else:
         indices = list(range(total))
 
-    renderer = doc.render_to(
-        pdfium.BitmapConv.pil_image,
-        page_indices=indices,
-        scale=dpi / 72.0,  # PDF user space is 72 DPI
-    )
-    # Iterate lazily over PIL images
-    for idx, pil in zip(indices, renderer):
+    # Render each page individually for broader compatibility
+    scale = dpi / 72.0  # PDF user space is 72 DPI
+    for idx in indices:
         try:
+            page = doc[idx]
+            try:
+                bmp = page.render(scale=scale)
+                pil = bmp.to_pil()
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
             filename = f"{stem}_p{idx+1:04d}.{fmt.lower()}"
             target = out_dir / filename
             if target.exists() and not overwrite:
@@ -114,4 +120,3 @@ def convert_pdf_to_images(
     except Exception:
         pass
     return created, skipped, errors
-
