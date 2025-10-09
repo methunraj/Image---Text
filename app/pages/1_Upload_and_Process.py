@@ -872,6 +872,22 @@ def run() -> None:
             key='per_file_mode_checkbox',
             help="Process each file separately and auto-save next to inputs",
         )
+
+    # Format selection when per-file save is enabled
+    save_formats = {'json': True, 'md': True, 'docx': True}  # Default: all formats
+    if per_file_mode:
+        st.markdown("**Select formats to save:**")
+        fcol1, fcol2, fcol3, _ = st.columns([1, 1, 1, 3])
+        with fcol1:
+            save_formats['json'] = st.checkbox("JSON", value=True, key='save_json')
+        with fcol2:
+            save_formats['md'] = st.checkbox("Markdown", value=True, key='save_md')
+        with fcol3:
+            save_formats['docx'] = st.checkbox("Word", value=True, key='save_docx')
+
+        # Ensure at least one format is selected
+        if not any(save_formats.values()):
+            st.warning("⚠️ Please select at least one format to save")
     # Allow auto-processing (e.g., after PDF conversion)
     auto_process_flag = bool(st.session_state.get('_auto_process_request', False))
     if auto_process_flag:
@@ -917,6 +933,11 @@ def run() -> None:
     
     # Per-file mode: run one-by-one and save
     if process_clicked and selected_template and per_file_mode:
+        # Check if at least one format is selected
+        if not any(save_formats.values()):
+            st.error("⚠️ Please select at least one format to save before processing")
+            return
+
         st.markdown("### Processing & Saving Per File")
         from scripts.export_records import to_docx_bytes, to_docx_from_text_bytes
         total = len(selected)
@@ -964,29 +985,44 @@ def run() -> None:
                     if checkpoint is not None:
                         checkpoint.mark_failed(img_path, "No output")
                 else:
+                    saved_files = {}
                     if unstructured and isinstance(out, dict) and 'raw_text' in out:
                         text = str(out.get('raw_text') or "")
-                        (out_dir / f"{base_name}.md").write_bytes((text or "").encode("utf-8"))
-                        docx_bytes = to_docx_from_text_bytes(text, title=base_name)
-                        (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
-                        recs = ensure_records({"raw_text": text})
-                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                        # Save only selected formats
+                        if save_formats.get('md', False):
+                            (out_dir / f"{base_name}.md").write_bytes((text or "").encode("utf-8"))
+                            saved_files['md'] = str(out_dir / f"{base_name}.md")
+                            saved_counts['md'] += 1
+                        if save_formats.get('docx', False):
+                            docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                            (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                            saved_files['docx'] = str(out_dir / f"{base_name}.docx")
+                            saved_counts['docx'] += 1
+                        if save_formats.get('json', False):
+                            recs = ensure_records({"raw_text": text})
+                            (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                            saved_files['json'] = str(out_dir / f"{base_name}.json")
+                            saved_counts['json'] += 1
                         if checkpoint is not None:
-                            checkpoint.mark_processed(img_path, {"json": str(out_dir / f"{base_name}.json"), "md": str(out_dir / f"{base_name}.md"), "docx": str(out_dir / f"{base_name}.docx")})
-                        saved_counts['md'] += 1
-                        saved_counts['docx'] += 1
-                        saved_counts['json'] += 1
+                            checkpoint.mark_processed(img_path, saved_files)
                     else:
                         recs = ensure_records(out)
                         cols = all_columns(recs)
-                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
-                        (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
-                        (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
+                        # Save only selected formats
+                        if save_formats.get('json', False):
+                            (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
+                            saved_files['json'] = str(out_dir / f"{base_name}.json")
+                            saved_counts['json'] += 1
+                        if save_formats.get('md', False):
+                            (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
+                            saved_files['md'] = str(out_dir / f"{base_name}.md")
+                            saved_counts['md'] += 1
+                        if save_formats.get('docx', False):
+                            (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
+                            saved_files['docx'] = str(out_dir / f"{base_name}.docx")
+                            saved_counts['docx'] += 1
                         if checkpoint is not None:
-                            checkpoint.mark_processed(img_path, {"json": str(out_dir / f"{base_name}.json"), "md": str(out_dir / f"{base_name}.md"), "docx": str(out_dir / f"{base_name}.docx")})
-                        saved_counts['json'] += 1
-                        saved_counts['md'] += 1
-                        saved_counts['docx'] += 1
+                            checkpoint.mark_processed(img_path, saved_files)
             except Exception as e:
                 errors.append(f"Save failed for {Path(img_path).name}: {e}")
                 if checkpoint is not None:
@@ -999,7 +1035,20 @@ def run() -> None:
                     except Exception:
                         pass
         progress.empty()
-        st.success(f"Saved: {saved_counts['json']} JSON, {saved_counts['md']} MD, {saved_counts['docx']} DOCX next to inputs")
+
+        # Build success message showing only selected formats
+        saved_msgs = []
+        if save_formats.get('json', False):
+            saved_msgs.append(f"{saved_counts['json']} JSON")
+        if save_formats.get('md', False):
+            saved_msgs.append(f"{saved_counts['md']} Markdown")
+        if save_formats.get('docx', False):
+            saved_msgs.append(f"{saved_counts['docx']} Word")
+
+        if saved_msgs:
+            st.success(f"✅ Saved: {', '.join(saved_msgs)} files next to inputs")
+        else:
+            st.warning("⚠️ No files saved (no formats selected)")
         if errors:
             with st.expander("Errors encountered"):
                 for e in errors:

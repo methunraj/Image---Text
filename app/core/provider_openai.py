@@ -224,6 +224,12 @@ class OAIGateway:
         
         return any(indicator in url_lower for indicator in local_indicators)
 
+    def _is_google_openai(self) -> bool:
+        """Detect Google's OpenAI‑compatible endpoint (Generative Language)."""
+        base = (self.base_url or "").lower()
+        # Check for both /openai and /openai/ to handle URLs with or without trailing slash
+        return "generativelanguage.googleapis.com" in base and "/openai" in base
+
     def _headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {"Content-Type": "application/json"}
         if self.headers:
@@ -785,7 +791,9 @@ class OAIGateway:
                 # Anthropic Claude
                 "max_tokens_to_sample", "max_tokens",
                 # Google (Gemini, PaLM)
-                "maxOutputTokens", "max_output_tokens", "candidateCount",
+                # When using OpenAI compatibility, prefer OpenAI-style params
+                "max_tokens", "max_completion_tokens",  # Try OpenAI params first
+                "max_output_tokens", "maxOutputTokens",  # Then Google native params
                 # Cohere
                 "max_tokens", "max_output_tokens",
                 # Azure OpenAI
@@ -815,6 +823,13 @@ class OAIGateway:
             if self.max_tokens_param_override and not self.cached_max_tokens_param:
                 self.cached_max_tokens_param = self.max_tokens_param_override
             cached_param = self.cached_max_tokens_param
+
+            # Provider-specific correction: Google's OpenAI-compatible API expects
+            # OpenAI-style params when in compatibility mode. Clear native Google params.
+            if self._is_google_openai() and cached_param in ("maxOutputTokens", "max_output_tokens"):
+                print("⚙️ Google OpenAI-compatible endpoint detected; clearing native parameter '" + str(cached_param) + "' to probe OpenAI-style params.")
+                cached_param = None
+                self.cached_max_tokens_param = None
 
             tried: List[str] = []
             last_exc: Optional[httpx.HTTPStatusError] = None
@@ -894,10 +909,17 @@ class OAIGateway:
                     param_error_keywords = [
                         "unsupported parameter", "unknown parameter", "is not supported",
                         "invalid_request_error", "unrecognized parameter", "invalid parameter",
-                        "not a valid parameter", "unexpected parameter", "extra parameter"
+                        "not a valid parameter", "unexpected parameter", "extra parameter",
+                        # Google's generic error messages
+                        "invalid argument", "invalid value", "bad request",
+                        "request contains an invalid argument"
                     ]
                     
                     is_param_error = status in (400, 422) and any(kw in low for kw in param_error_keywords)
+                    # Treat Google OpenAI 400s with any max_tokens variant as parameter errors even if message is generic
+                    if status in (400, 422) and self._is_google_openai() and key:
+                        # Google often returns generic errors for parameter issues
+                        is_param_error = True
                     
                     if is_param_error and key:
                         if cached_param == key:
@@ -1074,19 +1096,18 @@ class OAIGateway:
                 body_text = ""
             # Check if we should fallback to EncB
             if status in (400, 415, 422) and self.allow_input_image_fallback:
-                bt = (body_text or "").lower()
-                # Retry once with EncB (input_image) and re-run token key variants
-                if ("image_url" in bt) or ("data:" in bt):
-                    enc_used = "EncB"
-                    messages_b = payload_messages + [self._build_user_with_images_enc_b(user_text, image_paths)]
-                    try:
-                        return _send_with_max_variants(messages_b)
-                    except httpx.HTTPStatusError as e2:
-                        status2 = e2.response.status_code if hasattr(e2, "response") else 500
-                        body2 = e2.response.text if hasattr(e2, "response") and hasattr(e2.response, "text") else ""
-                        return error_out(status2, body2, f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
-                    except httpx.TimeoutException:
-                        return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+                # Always retry with EncB on these status codes to re-probe parameters
+                # This helps with both image encoding issues AND parameter compatibility
+                enc_used = "EncB"
+                messages_b = payload_messages + [self._build_user_with_images_enc_b(user_text, image_paths)]
+                try:
+                    return _send_with_max_variants(messages_b)
+                except httpx.HTTPStatusError as e2:
+                    status2 = e2.response.status_code if hasattr(e2, "response") else 500
+                    body2 = e2.response.text if hasattr(e2, "response") and hasattr(e2.response, "text") else ""
+                    return error_out(status2, body2, f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+                except httpx.TimeoutException:
+                    return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
             # Not a fallback case; surface error
             return error_out(status, body_text or "", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
         except httpx.TimeoutException:
