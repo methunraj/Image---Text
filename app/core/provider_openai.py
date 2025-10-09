@@ -200,10 +200,9 @@ class OAIGateway:
         elif self.auth_mode == "header" and self.auth_token and self.auth_header_name:
             h[self.auth_header_name] = self.auth_token
 
-        if "openrouter.ai" in (self.base_url or ""):
-            # OpenRouter requires HTTP-Referer and X-Title; keep user overrides if provided.
-            h.setdefault("HTTP-Referer", (self.headers or {}).get("HTTP-Referer", "http://localhost"))
-            h.setdefault("X-Title", (self.headers or {}).get("X-Title", "Images-JSON App"))
+        # Note: OpenRouter requires HTTP-Referer and X-Title headers.
+        # These should be configured in Excel via extra_headers or passed in self.headers.
+        # No hardcoded defaults to enforce explicit configuration.
         return h
     
     def _mask_sensitive_data(self, data: Any) -> Any:
