@@ -3,18 +3,6 @@ from __future__ import annotations
 from typing import Dict, Any, Optional
 
 
-def calculate_cost(model: str, input_tokens: int, output_tokens: int, catalog: Dict[str, Any]) -> float:
-    """Compute USD cost using a legacy catalog mapping.
-
-    Expects pricing like {"pricing": {"input_per_1k": float, "output_per_1k": float}}.
-    """
-    m = catalog.get(model, {}) if catalog else {}
-    pricing = (m.get("pricing") or {}) if isinstance(m, dict) else {}
-    in_per_1k = float(pricing.get("input_per_1k", 0.0))
-    out_per_1k = float(pricing.get("output_per_1k", 0.0))
-    return (input_tokens / 1000.0) * in_per_1k + (output_tokens / 1000.0) * out_per_1k
-
-
 def _unit_divisor(cost_block: Dict[str, Any]) -> float:
     """Determine token unit divisor from a models.dev 'cost' block.
 

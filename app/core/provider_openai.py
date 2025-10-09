@@ -122,50 +122,6 @@ def encode_image_to_b64(path: str) -> Tuple[str, str]:
     return encode_image_to_b64_cached(cache_key)
 
 
-def tiny_png_b64() -> str:
-    return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAukB9jQ9a6EAAAAASUVORK5CYII="
-
-
-class OpenAIProvider:
-    """Backward-compatible minimal client used by Settings probe."""
-
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
-        self.base_url = (base_url or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")).rstrip("/")
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-    def chat(self, model: str, messages: List[Dict[str, Any]], temperature: float = 0.0, max_tokens: int | None = None, **extra: Any) -> Dict[str, Any]:
-        url = f"{self.base_url}/chat/completions"
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if extra:
-            payload.update(extra)
-
-        with httpx.Client(timeout=3600.0) as client:
-            resp = client.post(url, headers=self._headers(), json=payload)
-            resp.raise_for_status()
-            return resp.json()
-
-    @staticmethod
-    def image_message(role: str, text: str | None, image_urls: List[str]) -> Dict[str, Any]:
-        content: List[Dict[str, Any]] = []
-        if text:
-            content.append({"type": "text", "text": text})
-        for url in image_urls:
-            content.append({"type": "image_url", "image_url": {"url": url}})
-        return {"role": role, "content": content}
-
-
 @dataclass
 class OAIGateway:
     """OpenAI-compatible gateway that works with registry-provided descriptors."""
@@ -376,224 +332,64 @@ class OAIGateway:
         return {"role": "user", "content": parts}
 
     def _extract_text_and_tool(self, data: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
-        verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-        if not verbose:
-            def _noop(*args, **kwargs):
-                return None
-            # Shadow print locally for non-verbose mode
-            print = _noop  # type: ignore
+        """Extract text and tool call from OpenAI-compatible response.
+        
+        Supports standard OpenAI format: choices[0].message.content + tool_calls
+        """
         text: Optional[str] = None
         tool_call: Optional[Dict[str, Any]] = None
         
-        print(f"Debug [_extract_text_and_tool]: Starting extraction with data keys: {list(data.keys())}")
-        
         try:
-            # Handle different response formats
+            # Standard OpenAI format: choices[0].message
             choices = data.get("choices", [])
-            print(f"Debug [_extract_text_and_tool]: Choices: {type(choices)}, length: {len(choices) if isinstance(choices, list) else 'N/A'}")
-            
             if not choices:
-                print(f"Debug [_extract_text_and_tool]: No choices found, checking top-level keys")
-                # Some providers might return completion directly
-                for key in ["completion", "text", "content", "output", "result"]:
-                    if key in data:
-                        text = data[key]
-                        print(f"Debug [_extract_text_and_tool]: Found text in top-level key '{key}': {repr(text)[:100]}")
-                        return text, tool_call
-                print(f"Debug [_extract_text_and_tool]: No text found in top-level keys")
-                return text, tool_call
+                # Fallback: check top-level keys for non-standard providers
+                for key in ["text", "content", "completion"]:
+                    if key in data and isinstance(data[key], str):
+                        return data[key], None
+                return None, None
             
             choice = choices[0]
-            print(f"Debug [_extract_text_and_tool]: First choice type: {type(choice)}")
-            print(f"Debug [_extract_text_and_tool]: First choice keys: {list(choice.keys()) if isinstance(choice, dict) else 'Not a dict'}")
+            if not isinstance(choice, dict):
+                return None, None
             
-            # Check all possible locations for text in the choice
-            if isinstance(choice, dict):
-                # Direct text in choice
-                if "text" in choice:
-                    text = choice["text"]
-                    print(f"Debug [_extract_text_and_tool]: Found text directly in choice: {repr(text)[:100]}")
+            # Extract from message
+            msg = choice.get("message", {})
+            if isinstance(msg, dict):
+                # Text content
+                content = msg.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    # Content as list of parts (OpenAI format)
+                    texts = [
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    ]
+                    text = "\n".join(texts) if texts else None
                 
-                # Message-based extraction
-                msg = choice.get("message") or {}
-                print(f"Debug [_extract_text_and_tool]: Message type: {type(msg)}")
-                print(f"Debug [_extract_text_and_tool]: Message keys: {list(msg.keys()) if isinstance(msg, dict) else 'Not a dict'}")
+                # Tool calls
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    func = tool_calls[0].get("function", {})
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            tool_call = json.loads(args)
+                        except:
+                            pass
+                    elif isinstance(args, dict):
+                        tool_call = args
+            
+            # Fallback: check for text directly in choice
+            if text is None and "text" in choice:
+                text = choice["text"]
                 
-                if isinstance(msg, dict):
-                    # Text extraction from message content
-                    content = msg.get("content")
-                    print(f"Debug [_extract_text_and_tool]: Content type: {type(content)}")
-                    print(f"Debug [_extract_text_and_tool]: Content value: {repr(content)}")
-                    
-                    if isinstance(content, str):
-                        text = content
-                        print(f"Debug [_extract_text_and_tool]: Extracted string content: {repr(text)[:100]}")
-                    elif isinstance(content, list):
-                        print(f"Debug [_extract_text_and_tool]: Content is list with {len(content)} items")
-                        # OpenAI may return content as list of parts
-                        texts = []
-                        for i, part in enumerate(content):
-                            print(f"Debug [_extract_text_and_tool]: Part {i}: {type(part)}, keys: {list(part.keys()) if isinstance(part, dict) else 'Not a dict'}")
-                            if isinstance(part, dict):
-                                part_type = part.get("type")
-                                part_text = part.get("text", "")
-                                print(f"Debug [_extract_text_and_tool]: Part {i} type: {part_type}, text: {repr(part_text)[:50]}")
-                                if part_type == "text" and part_text:
-                                    texts.append(part_text)
-                        text = "\n".join(texts) if texts else None
-                        print(f"Debug [_extract_text_and_tool]: Assembled text from list parts: {repr(text)[:100] if text else 'None'}")
-                    elif content is None:
-                        print(f"Debug [_extract_text_and_tool]: Content is None")
-                    else:
-                        print(f"Debug [_extract_text_and_tool]: Content is unexpected type: {type(content)}")
-                    
-                    # Tools extraction
-                    tcs = msg.get("tool_calls")
-                    print(f"Debug [_extract_text_and_tool]: Tool calls: {type(tcs)}, value: {tcs}")
-                    if isinstance(tcs, list) and tcs:
-                        print(f"Debug [_extract_text_and_tool]: Processing {len(tcs)} tool calls")
-                        fun = tcs[0].get("function", {})
-                        args = fun.get("arguments")
-                        print(f"Debug [_extract_text_and_tool]: Tool args type: {type(args)}, value: {args}")
-                        if isinstance(args, str):
-                            try:
-                                import json as _json
-                                tool_call = _json.loads(args)
-                                print(f"Debug [_extract_text_and_tool]: Parsed tool call from string: {tool_call}")
-                            except Exception as parse_err:
-                                print(f"Debug [_extract_text_and_tool]: Failed to parse tool args: {parse_err}")
-                                tool_call = None
-                        elif isinstance(args, dict):
-                            tool_call = args
-                            print(f"Debug [_extract_text_and_tool]: Using tool args as dict: {tool_call}")
-                
-                # Additional fallback checks
-                if text is None:
-                    print(f"Debug [_extract_text_and_tool]: No text found yet, checking additional choice keys")
-                    for key in ["delta", "completion", "output"]:
-                        if key in choice:
-                            fallback_content = choice[key]
-                            print(f"Debug [_extract_text_and_tool]: Found fallback key '{key}': {type(fallback_content)}")
-                            if isinstance(fallback_content, dict) and "content" in fallback_content:
-                                text = fallback_content["content"]
-                                print(f"Debug [_extract_text_and_tool]: Extracted text from {key}.content: {repr(text)[:100]}")
-                                break
-                            elif isinstance(fallback_content, str):
-                                text = fallback_content
-                                print(f"Debug [_extract_text_and_tool]: Used {key} directly as text: {repr(text)[:100]}")
-                                break
-            
-            print(f"Debug [_extract_text_and_tool]: Final extraction results:")
-            print(f"  - Text: {repr(text) if text else 'None'}")
-            print(f"  - Text length: {len(text) if text else 0} characters")
-            # Estimate token count (rough approximation: ~4 chars per token)
-            if text:
-                estimated_tokens = len(text) // 4
-                print(f"  - Estimated tokens: ~{estimated_tokens} tokens")
-                if estimated_tokens < 250:
-                    print(f"  - WARNING: Output appears truncated at ~{estimated_tokens} tokens!")
-            print(f"  - Tool call: {tool_call}")
-            
-        except Exception as e:
-            print(f"Debug [_extract_text_and_tool]: Exception during extraction: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        # Final OpenRouter-specific fallback
-        if text is None and "openrouter.ai" in getattr(self, 'base_url', ''):
-            print(f"Debug [_extract_text_and_tool]: Applying OpenRouter-specific extraction fallbacks")
-            text = self._openrouter_extract_text(data)
-            if text:
-                print(f"Debug [_extract_text_and_tool]: OpenRouter fallback extracted: {repr(text)[:100]}")
-            
+        except Exception:
+            pass
+        
         return text, tool_call
-
-    def _openrouter_extract_text(self, data: Dict[str, Any]) -> Optional[str]:
-        """OpenRouter-specific text extraction fallbacks"""
-        verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-        if not verbose:
-            def _noop(*args, **kwargs):
-                return None
-            # Shadow print locally for non-verbose mode
-            print = _noop  # type: ignore
-        print(f"Debug [_openrouter_extract_text]: Checking OpenRouter-specific patterns")
-        
-        # Check for non-standard response structures that OpenRouter might use
-        patterns_to_check = [
-            # Direct response patterns
-            ("response", "text"),
-            ("response", "content"),
-            ("data", "response"),
-            ("output", "text"),
-            ("result", "content"),
-            
-            # Nested patterns
-            ("choices", 0, "text"),
-            ("choices", 0, "content"),
-            ("choices", 0, "message", "text"),
-            ("choices", 0, "delta", "text"),
-            ("data", "choices", 0, "message", "content"),
-            ("data", "choices", 0, "text"),
-            
-            # Generation patterns (some APIs use these)
-            ("generations", 0, "text"),
-            ("completions", 0, "text"),
-        ]
-        
-        for pattern in patterns_to_check:
-            try:
-                current = data
-                for key in pattern:
-                    if isinstance(key, int):
-                        if isinstance(current, list) and len(current) > key:
-                            current = current[key]
-                        else:
-                            break
-                    elif isinstance(current, dict) and key in current:
-                        current = current[key]
-                    else:
-                        break
-                else:
-                    # We successfully navigated the pattern
-                    if isinstance(current, str) and current.strip():
-                        print(f"Debug [_openrouter_extract_text]: Found text via pattern {pattern}: {repr(current)[:50]}")
-                        return current
-            except Exception as e:
-                print(f"Debug [_openrouter_extract_text]: Error checking pattern {pattern}: {e}")
-                continue
-        
-        # Check for any string values in the response that might be the content
-        def find_likely_content(obj, path=""):
-            if isinstance(obj, str) and len(obj.strip()) > 10:  # Likely content if > 10 chars
-                if not any(keyword in obj.lower() for keyword in ['error', 'invalid', 'failed', 'exception']):
-                    print(f"Debug [_openrouter_extract_text]: Found potential content at {path}: {repr(obj)[:50]}")
-                    return obj
-            elif isinstance(obj, dict):
-                for key, value in obj.items():
-                    if key in ['content', 'text', 'response', 'output', 'result', 'completion']:
-                        result = find_likely_content(value, f"{path}.{key}")
-                        if result:
-                            return result
-                # Check other keys too
-                for key, value in obj.items():
-                    if key not in ['id', 'object', 'created', 'model', 'usage', 'error', 'status']:
-                        result = find_likely_content(value, f"{path}.{key}")
-                        if result:
-                            return result
-            elif isinstance(obj, list) and obj:
-                for i, item in enumerate(obj[:3]):  # Check first 3 items only
-                    result = find_likely_content(item, f"{path}[{i}]")
-                    if result:
-                        return result
-            return None
-        
-        potential_content = find_likely_content(data)
-        if potential_content:
-            print(f"Debug [_openrouter_extract_text]: Found potential content: {repr(potential_content)[:100]}")
-            return potential_content
-            
-        print(f"Debug [_openrouter_extract_text]: No content found via OpenRouter fallbacks")
-        return None
 
     def chat_vision(
         self,

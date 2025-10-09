@@ -24,10 +24,10 @@ from app.core import ui as core_ui
 from app.core import storage
 from app.core import template_assets
 from app.core.model_registry import ModelRegistryError, active_model, config_metadata, ensure_registry, reload_registry
-from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path, cache_provider_logo
+from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path
 from app.core.provider_endpoints import get_provider_base_urls
 from app.core.local_models import is_local_provider, list_local_providers, discover_provider_models
-from app.core.provider_openai import OpenAIProvider, OAIGateway, tiny_png_data_url
+from app.core.provider_openai import OAIGateway, tiny_png_data_url
 from app.core.templating import Example, RenderedMessages, render_user_prompt
 
 
@@ -1787,7 +1787,7 @@ def run() -> None:  # type: ignore[no-redef]
     with st.sidebar:
         try:
             descriptor = active_model()
-            logo = cache_provider_logo(descriptor.provider_id)
+            logo = get_logo_path(descriptor.provider_id)
             core_ui.status_chip("Active Model", descriptor.label, logo_path=logo)
         except ModelRegistryError:
             core_ui.status_chip("Active Model", "Unavailable")

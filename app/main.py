@@ -17,7 +17,7 @@ from app.core import storage
 from app.core import template_assets
 from app.core import ui as core_ui
 from app.core.model_registry import ModelRegistryError, active_model, ensure_registry
-from app.core.models_dev import cache_provider_logo
+from app.core.models_dev import get_logo_path
 
 
 def _get_active_profile() -> tuple[str, str | None]:
@@ -40,7 +40,7 @@ def _get_active_profile() -> tuple[str, str | None]:
     try:
         descriptor = active_model()
         name = descriptor.label
-        logo = cache_provider_logo(descriptor.provider_id)
+        logo = get_logo_path(descriptor.provider_id)
         return name, logo
     except ModelRegistryError:
         pass
