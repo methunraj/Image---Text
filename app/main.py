@@ -140,29 +140,45 @@ def main() -> None:
                     from app.core.currency import get_usd_to_inr, convert_usd_to_inr
                     usd_to_inr = get_usd_to_inr()
                     
+                    # Show currency rate badge
+                    if usd_to_inr:
+                        st.markdown(
+                            f'<div style="background-color: #d1fae5; color: #065f46; padding: 4px 8px; '
+                            f'border-radius: 4px; font-size: 0.75rem; margin-bottom: 8px; text-align: center;">'
+                            f'💱 1 USD = ₹{usd_to_inr:.2f}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Compact stats
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.metric("Images", stats['total_images'])
+                        st.markdown(f"**Images**  \n{stats['total_images']}")
                     with col2:
-                        st.metric("Runs", stats['total_runs'])
+                        st.markdown(f"**Runs**  \n{stats['total_runs']}")
                     
-                    # Cost metrics
+                    # Cost metrics - compact format
                     total_usd = stats['total_cost_usd']
-                    st.metric("Total Spent", f"${total_usd:.4f}")
-                    
                     if usd_to_inr:
                         total_inr = convert_usd_to_inr(total_usd, rate=usd_to_inr)
                         if total_inr is not None:
-                            st.caption(f"≈ ₹{total_inr:.2f} INR")
+                            st.markdown(f"**Total Spent**  \n${total_usd:.4f} • ₹{total_inr:.2f}")
+                        else:
+                            st.markdown(f"**Total Spent**  \n${total_usd:.4f}")
+                    else:
+                        st.markdown(f"**Total Spent**  \n${total_usd:.4f}")
                     
-                    # Average per image
+                    # Average per image - only show if there are images
                     if stats['total_images'] > 0:
                         avg_usd = total_usd / stats['total_images']
-                        st.metric("Avg/Image", f"${avg_usd:.4f}")
                         if usd_to_inr:
                             avg_inr = convert_usd_to_inr(avg_usd, rate=usd_to_inr)
                             if avg_inr is not None:
-                                st.caption(f"≈ ₹{avg_inr:.4f} INR")
+                                st.caption(f"Avg/Image: ${avg_usd:.4f} • ₹{avg_inr:.2f}")
+                            else:
+                                st.caption(f"Avg/Image: ${avg_usd:.4f}")
+                        else:
+                            st.caption(f"Avg/Image: ${avg_usd:.4f}")
         except Exception as e:
             st.error(f"Error loading projects: {e}")
 

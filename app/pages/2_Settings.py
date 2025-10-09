@@ -2048,6 +2048,13 @@ def run() -> None:  # type: ignore[no-redef]
                     _usd_to_inr_rate = get_usd_to_inr()
                 except Exception:
                     _usd_to_inr_rate = None
+                
+                # Define formatting functions once (not in loop)
+                def _fmt_usd(v):
+                    return f"{v:.4f}" if v is not None else "—"
+                def _fmt_inr(v):
+                    return f"₹{v:.2f}" if v is not None else "—"
+                
                 for model in sorted(registry.models.values(), key=lambda m: (m.provider_label, m.label)):
                     if not model.show_in_ui:
                         continue
@@ -2063,32 +2070,41 @@ def run() -> None:  # type: ignore[no-redef]
                     # Prefer per million for display; derive from per_1k if needed
                     in_per_m = pricing.input_per_million if pricing.input_per_million is not None else (pricing.input_per_1k * 1000.0 if pricing.input_per_1k is not None else None)
                     out_per_m = pricing.output_per_million if pricing.output_per_million is not None else (pricing.output_per_1k * 1000.0 if pricing.output_per_1k is not None else None)
-                    # Optional INR
-                    def _fmt_usd(v):
-                        return f"{v:.4f}" if v is not None else "—"
-                    def _fmt_inr(v):
-                        return f"₹{v:.2f}" if v is not None else "—"
+                    # Calculate INR if rate available
                     in_inr = (in_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and in_per_m is not None) else None
                     out_inr = (out_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and out_per_m is not None) else None
-                    capabilities_rows.append(
-                        {
-                            "Provider": model.provider_label,
-                            "Model": model.label,
-                            "Route": model.route,
-                            "Vision": "✅" if caps.vision else "—",
-                            "Tools": "✅" if caps.tools else "—",
-                            "JSON": "✅" if caps.json_mode or caps.structured_output else "—",
-                            "Streaming": "✅" if caps.streaming else "—",
-                            "Context": f"{model.context_window:,}",
-                            "Max Output": model.max_output_tokens or "∞",
-                            "Input $/1M": _fmt_usd(in_per_m),
-                            "Output $/1M": _fmt_usd(out_per_m),
-                            **({"Input ₹/1M": _fmt_inr(in_inr), "Output ₹/1M": _fmt_inr(out_inr)} if _usd_to_inr_rate else {}),
-                            "Reasoning": reasoning_label,
-                        }
-                    )
+                    
+                    # Build row dict - always include INR columns if rate is available
+                    row_dict = {
+                        "Provider": model.provider_label,
+                        "Model": model.label,
+                        "Route": model.route,
+                        "Vision": "✅" if caps.vision else "—",
+                        "Tools": "✅" if caps.tools else "—",
+                        "JSON": "✅" if caps.json_mode or caps.structured_output else "—",
+                        "Streaming": "✅" if caps.streaming else "—",
+                        "Context": f"{model.context_window:,}",
+                        "Max Output": model.max_output_tokens or "∞",
+                        "Input $/1M": _fmt_usd(in_per_m),
+                        "Output $/1M": _fmt_usd(out_per_m),
+                    }
+                    
+                    # Add INR columns if exchange rate is available
+                    if _usd_to_inr_rate:
+                        row_dict["Input ₹/1M"] = _fmt_inr(in_inr)
+                        row_dict["Output ₹/1M"] = _fmt_inr(out_inr)
+                    
+                    row_dict["Reasoning"] = reasoning_label
+                    
+                    capabilities_rows.append(row_dict)
 
                 if capabilities_rows:
+                    # Show INR status message
+                    if _usd_to_inr_rate:
+                        st.success(f"💱 Exchange rate active: 1 USD = ₹{_usd_to_inr_rate:.2f} INR (INR columns visible in table below)")
+                    else:
+                        st.info("💡 Set exchange rate below to view INR pricing columns")
+                    
                     # For dataframe, width expects an int in current Streamlit; keep container width behavior
                     st.dataframe(capabilities_rows, use_container_width=True)
                 else:
@@ -2101,23 +2117,6 @@ def run() -> None:  # type: ignore[no-redef]
                     f"• Frontend temperature control: {'enabled' if policies.allow_frontend_temperature else 'disabled'}\n"
                     f"• Frontend model selection: {'enabled' if policies.allow_frontend_model_selection else 'disabled'}"
                 )
-
-                # Currency & Rates
-                with st.expander("Currency & Rates", expanded=False):
-                    st.caption("Set today's exchange rate to view INR estimates alongside USD.")
-                    from app.core.currency import load_rates, save_rates
-                    rates = load_rates()
-                    try:
-                        default_rate = float(rates.get("usd_to_inr", 0)) if rates.get("usd_to_inr") is not None else 0.0
-                    except Exception:
-                        default_rate = 0.0
-                    colr1, colr2 = st.columns([2,1])
-                    with colr1:
-                        usd_to_inr = st.number_input("USD → INR rate", min_value=0.0, max_value=1000.0, value=float(default_rate), step=0.1, help="Enter today's exchange rate (1 USD equals how many INR)")
-                    with colr2:
-                        if st.button("Save rate"):
-                            save_rates({"usd_to_inr": float(usd_to_inr) if usd_to_inr > 0 else None})
-                            st.success("Saved exchange rate")
 
     with tab_template:
         st.markdown("### Manage Templates")
