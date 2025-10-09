@@ -105,6 +105,49 @@ class FolderCheckpoint:
             self.data["model_id"] = model_id
         if unstructured is not None:
             self.data["unstructured"] = bool(unstructured)
+    
+    def set_project_context(self, project_id: Optional[int], project_name: Optional[str]) -> None:
+        """Set project context for this checkpoint."""
+        if project_id is not None:
+            self.data["project_id"] = project_id
+        if project_name is not None:
+            self.data["project_name"] = project_name
+    
+    def update_processing_stats(self, tokens_in: int, tokens_out: int, cost_usd: float) -> None:
+        """Update processing statistics incrementally."""
+        stats = self.data.setdefault("processing_stats", {
+            "total_images": 0,
+            "total_tokens_input": 0,
+            "total_tokens_output": 0,
+            "total_cost_usd": 0.0,
+            "images_processed": 0,
+            "images_failed": 0,
+            "avg_cost_per_image": 0.0
+        })
+        
+        stats["total_tokens_input"] = stats.get("total_tokens_input", 0) + tokens_in
+        stats["total_tokens_output"] = stats.get("total_tokens_output", 0) + tokens_out
+        stats["total_cost_usd"] = stats.get("total_cost_usd", 0.0) + cost_usd
+        stats["images_processed"] = stats.get("images_processed", 0) + 1
+        stats["total_images"] = stats.get("images_processed", 0)
+        
+        # Update average
+        if stats["images_processed"] > 0:
+            stats["avg_cost_per_image"] = stats["total_cost_usd"] / stats["images_processed"]
+        
+        self.data["processing_stats"] = stats
+    
+    def get_processing_stats(self) -> Dict[str, Any]:
+        """Get processing statistics."""
+        return self.data.get("processing_stats", {
+            "total_images": 0,
+            "total_tokens_input": 0,
+            "total_tokens_output": 0,
+            "total_cost_usd": 0.0,
+            "images_processed": 0,
+            "images_failed": 0,
+            "avg_cost_per_image": 0.0
+        })
 
     # File mapping helpers
     def _files(self) -> Dict[str, Any]:

@@ -1771,6 +1771,226 @@ Respond ONLY with JSON."""
         st.rerun()
 
 
+def _pdf_tools() -> None:
+    """PDF to Image converter interface."""
+    from app.core.pdf_convert import is_available as pdf_available, convert_pdf_to_images
+    from app.core.checkpoints import FolderCheckpoint
+    
+    if not pdf_available():
+        st.warning("⚠️ PDF conversion requires pypdfium2. Install with: `pip install pypdfium2`")
+        return
+    
+    st.markdown("Convert PDF pages to JPEG/PNG images for processing with vision models.")
+    
+    pdfs = st.file_uploader("Select PDF(s)", type=["pdf"], accept_multiple_files=True, key="pdf_uploader_settings")
+    
+    default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
+    out_folder = st.text_input(
+        "Output folder",
+        value=st.session_state.get("pdf_out_folder_settings", default_dir),
+        help="Pages will be saved here as images",
+        key="pdf_out_folder_settings_input"
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        dpi = st.number_input("DPI", min_value=72, max_value=600, value=200, step=10, key="pdf_dpi_settings")
+    with col2:
+        fmt = st.selectbox("Format", options=["PNG", "JPEG"], index=0, key="pdf_format_settings")
+    with col3:
+        overwrite = st.checkbox("Overwrite existing", value=False, key="pdf_overwrite_settings")
+    
+    page_spec = st.text_input("Pages (optional)", placeholder="e.g., 1-5,8", help="Leave blank to convert all pages", key="pdf_page_spec_settings")
+    
+    convert_clicked = st.button("Convert PDF → Images", type="primary")
+    
+    if convert_clicked:
+        if not pdfs:
+            st.error("Please select at least one PDF.")
+        else:
+            try:
+                import importlib
+                upload_module = importlib.import_module("app.pages.1_Upload_and_Process")
+                _normalize_folder_input = upload_module._normalize_folder_input
+                _find_images_in_folder = upload_module._find_images_in_folder
+                _sanitize_filename = upload_module._sanitize_filename
+                
+                out_dir = Path(_normalize_folder_input(out_folder)).resolve()
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                st.error(f"Cannot use output folder: {e}")
+            else:
+                created_total, skipped_total, errors_total = 0, 0, 0
+                created_paths: List[str] = []
+                skipped_paths: List[str] = []
+                
+                # Save PDFs to temp and convert
+                tmp_root = Path("data/uploads/pdf_tmp")
+                tmp_root.mkdir(parents=True, exist_ok=True)
+                
+                progress = st.progress(0.0, text="Converting PDFs...")
+                
+                for idx, f in enumerate(pdfs):
+                    try:
+                        tmp_path = tmp_root / _sanitize_filename(f.name)
+                        tmp_path.write_bytes(f.read())
+                        new, skipped, errs = convert_pdf_to_images(
+                            tmp_path, out_dir,
+                            dpi=dpi, fmt=fmt,
+                            overwrite=overwrite,
+                            page_spec=page_spec.strip() or None
+                        )
+                        created_total += len(new)
+                        skipped_total += len(skipped)
+                        errors_total += len(errs)
+                        created_paths.extend(new)
+                        skipped_paths.extend(skipped)
+                        progress.progress((idx + 1) / len(pdfs), text=f"Converted {idx + 1}/{len(pdfs)} PDFs")
+                    except Exception as e:
+                        st.warning(f"{f.name}: {e}")
+                
+                progress.empty()
+                
+                # Update checkpoint for the folder
+                try:
+                    cp = FolderCheckpoint(out_dir)
+                    cp.load()
+                    imgs_in_folder = _find_images_in_folder(out_dir, True)
+                    cp.ensure_entries(imgs_in_folder)
+                    cp.save()
+                except Exception:
+                    pass
+                
+                st.session_state["pdf_out_folder_settings"] = str(out_dir)
+                st.success(f"✅ Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
+                
+                if created_total > 0:
+                    st.info(f"💡 Images saved to: `{out_dir}`\n\nGo to **Upload & Process** to select this folder and process the images.")
+
+
+def _project_management() -> None:
+    """Project management interface."""
+    storage.init_db()
+    
+    projects = storage.list_projects()
+    active_project = storage.get_active_project()
+    
+    # Create new project section
+    with st.container(border=True):
+        st.markdown("#### Create New Project")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_name = st.text_input("Project Name", key="new_project_name", placeholder="e.g., Q1 2024 Invoices")
+            new_desc = st.text_area("Description (optional)", key="new_project_desc", placeholder="Describe the project purpose...")
+        with col2:
+            st.write("")  # Spacing
+            st.write("")
+            create_clicked = st.button("Create Project", type="primary", use_container_width=True)
+        
+        if create_clicked:
+            if not new_name.strip():
+                st.error("Project name cannot be empty")
+            else:
+                try:
+                    new_proj = storage.create_project(new_name.strip(), new_desc.strip() or None)
+                    st.success(f"✅ Project '{new_proj.name}' created!")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+    
+    st.divider()
+    
+    # List existing projects
+    st.markdown("#### Existing Projects")
+    
+    if not projects:
+        st.info("No projects yet. Create one above to get started!")
+        return
+    
+    for proj in projects:
+        with st.container(border=True):
+            col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
+            
+            with col1:
+                is_active_marker = "🟢 " if (active_project and proj.id == active_project.id) else ""
+                st.markdown(f"**{is_active_marker}{proj.name}**")
+                if proj.description:
+                    st.caption(proj.description)
+            
+            with col2:
+                stats = storage.get_project_stats(proj.id)
+                st.metric("Images", stats['total_images'])
+            
+            with col3:
+                st.metric("Cost", f"${stats['total_cost_usd']:.4f}")
+            
+            with col4:
+                if active_project and proj.id == active_project.id:
+                    st.success("Active")
+                else:
+                    if st.button("Set Active", key=f"activate_{proj.id}"):
+                        storage.set_active_project(proj.id)
+                        st.rerun()
+            
+            # Action buttons
+            col_edit, col_report, col_del = st.columns([1, 1, 1])
+            
+            with col_edit:
+                if st.button("✏️ Edit", key=f"edit_{proj.id}"):
+                    st.session_state[f"editing_{proj.id}"] = True
+                    st.rerun()
+            
+            with col_report:
+                from app.core.report_generator import save_project_report
+                if st.button("📊 Generate Report", key=f"report_{proj.id}"):
+                    try:
+                        export_dir = Path("export")
+                        report_path = save_project_report(proj.id, export_dir)
+                        st.success(f"✅ Report saved to: `{report_path}`")
+                        
+                        # Offer download
+                        report_content = report_path.read_text(encoding="utf-8")
+                        st.download_button(
+                            "📥 Download Report",
+                            data=report_content,
+                            file_name=report_path.name,
+                            mime="text/markdown",
+                            key=f"download_report_{proj.id}"
+                        )
+                    except Exception as e:
+                        st.error(f"Failed to generate report: {e}")
+            
+            with col_del:
+                if st.button("🗑️ Delete", key=f"delete_{proj.id}"):
+                    try:
+                        storage.delete_project(proj.id)
+                        st.success(f"Deleted project '{proj.name}'")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+            
+            # Edit mode
+            if st.session_state.get(f"editing_{proj.id}", False):
+                st.markdown("##### Edit Project")
+                edit_name = st.text_input("Name", value=proj.name, key=f"edit_name_{proj.id}")
+                edit_desc = st.text_area("Description", value=proj.description or "", key=f"edit_desc_{proj.id}")
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.button("Save", key=f"save_edit_{proj.id}"):
+                        try:
+                            storage.update_project(proj.id, name=edit_name.strip(), description=edit_desc.strip() or None)
+                            st.session_state[f"editing_{proj.id}"] = False
+                            st.success("Project updated!")
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+                with col_cancel:
+                    if st.button("Cancel", key=f"cancel_edit_{proj.id}"):
+                        st.session_state[f"editing_{proj.id}"] = False
+                        st.rerun()
+
+
 # Override old run() with registry-driven workflow
 def run() -> None:  # type: ignore[no-redef]
     load_dotenv(override=False)
@@ -1792,7 +2012,7 @@ def run() -> None:  # type: ignore[no-redef]
         except ModelRegistryError:
             core_ui.status_chip("Active Model", "Unavailable")
 
-    tab_model, tab_template = st.tabs(["🤖 Models", "📝 Templates"])
+    tab_model, tab_template, tab_pdf, tab_projects = st.tabs(["🤖 Models", "📝 Templates", "📄 PDF Tools", "📁 Projects"])
 
     with tab_model:
         st.markdown("### Model Registry")
@@ -1903,6 +2123,16 @@ def run() -> None:  # type: ignore[no-redef]
         st.markdown("### Manage Templates")
         st.caption("Create and manage prompt templates for consistent extraction")
         _template_management()
+    
+    with tab_pdf:
+        st.markdown("### PDF to Image Converter")
+        st.caption("Convert PDF pages to images for processing")
+        _pdf_tools()
+    
+    with tab_projects:
+        st.markdown("### Project Management")
+        st.caption("Create and manage projects to track spending")
+        _project_management()
 
 
 run()

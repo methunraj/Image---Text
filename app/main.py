@@ -92,6 +92,79 @@ def main() -> None:
         st.markdown("<hr>", unsafe_allow_html=True)
         prof_name, logo = _get_active_profile()
         core_ui.status_chip("Active Model", prof_name, logo_path=logo)
+        
+        # Project selector and money tracker
+        st.markdown("---")
+        st.markdown("#### 📁 Active Project")
+        
+        try:
+            projects = storage.list_projects()
+            if not projects:
+                # Initialize with default project if none exist
+                storage.init_db()
+                projects = storage.list_projects()
+            
+            if projects:
+                active_project = storage.get_active_project()
+                project_names = [p.name for p in projects]
+                
+                # If no active project, set the first one as active
+                if not active_project and projects:
+                    storage.set_active_project(projects[0].id)
+                    active_project = projects[0]
+                
+                current_index = 0
+                if active_project and active_project.name in project_names:
+                    current_index = project_names.index(active_project.name)
+                
+                selected = st.selectbox(
+                    "Select Project",
+                    options=project_names,
+                    index=current_index,
+                    key="sidebar_project_selector",
+                    label_visibility="collapsed"
+                )
+                
+                # Switch project if selection changed
+                if active_project and selected != active_project.name:
+                    new_proj = next((p for p in projects if p.name == selected), None)
+                    if new_proj:
+                        storage.set_active_project(new_proj.id)
+                        st.rerun()
+                
+                # Show project stats
+                if active_project:
+                    stats = storage.get_project_stats(active_project.id)
+                    
+                    # Get currency rate for INR display
+                    from app.core.currency import get_usd_to_inr, convert_usd_to_inr
+                    usd_to_inr = get_usd_to_inr()
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Images", stats['total_images'])
+                    with col2:
+                        st.metric("Runs", stats['total_runs'])
+                    
+                    # Cost metrics
+                    total_usd = stats['total_cost_usd']
+                    st.metric("Total Spent", f"${total_usd:.4f}")
+                    
+                    if usd_to_inr:
+                        total_inr = convert_usd_to_inr(total_usd, rate=usd_to_inr)
+                        if total_inr is not None:
+                            st.caption(f"≈ ₹{total_inr:.2f} INR")
+                    
+                    # Average per image
+                    if stats['total_images'] > 0:
+                        avg_usd = total_usd / stats['total_images']
+                        st.metric("Avg/Image", f"${avg_usd:.4f}")
+                        if usd_to_inr:
+                            avg_inr = convert_usd_to_inr(avg_usd, rate=usd_to_inr)
+                            if avg_inr is not None:
+                                st.caption(f"≈ ₹{avg_inr:.4f} INR")
+        except Exception as e:
+            st.error(f"Error loading projects: {e}")
 
     # Clean title with muted subtitle
     st.title("🧩 Images -> JSON")

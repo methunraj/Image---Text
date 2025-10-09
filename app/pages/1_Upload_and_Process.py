@@ -364,10 +364,13 @@ def run() -> None:
 
     src_choice = st.radio(
         "Source",
-        options=["Upload files", "Select folder", "Upload PDF"],
+        options=["Upload files", "Select folder"],
         horizontal=True,
-        help="Upload individual images, add an entire folder, or convert PDFs to images"
+        help="Upload individual images or add an entire folder"
     )
+    
+    # Info about PDF conversion
+    st.info("💡 Need to convert PDFs to images? Use **Settings → PDF Tools** to convert PDF pages to images first.")
 
     if src_choice == "Upload files":
         uploaded = st.file_uploader(
@@ -502,124 +505,6 @@ def run() -> None:
                         if p not in selected_lst:
                             selected_lst.append(p)
                     st.success(f"✅ Added {added} image(s) from folder")
-    elif src_choice == "Upload PDF":
-        # PDF conversion UI
-        from app.core.pdf_convert import is_available as pdf_available, convert_pdf_to_images
-        st.caption("Convert PDF pages to images and save them to a folder")
-        pdfs = st.file_uploader("Select PDF(s)", type=["pdf"], accept_multiple_files=True)
-        default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
-        out_folder = st.text_input("Output folder", value=st.session_state.get("pdf_out_folder", default_dir), help="Pages will be saved here as images")
-        c1, c2, c3 = st.columns([1,1,2])
-        with c1:
-            dpi = st.number_input("DPI", min_value=72, max_value=600, value=200, step=10)
-        with c2:
-            fmt = st.selectbox("Format", options=["PNG", "JPEG"], index=0)
-        with c3:
-            overwrite = st.checkbox("Overwrite existing", value=False)
-        page_spec = st.text_input("Pages (optional)", placeholder="e.g., 1-5,8")
-        b1, b2 = st.columns([1,1])
-        with b1:
-            convert_only = st.button("Convert Pages")
-        with b2:
-            convert_and_queue = st.button("Convert & Queue")
-
-        if (convert_only or convert_and_queue):
-            # Validate
-            if not pdf_available():
-                st.error("pypdfium2 not installed. Please run: pip install -r requirements.txt")
-            elif not pdfs:
-                st.error("Please select at least one PDF.")
-            else:
-                try:
-                    out_dir = Path(_normalize_folder_input(out_folder)).resolve()
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                except Exception as e:
-                    st.error(f"Cannot use output folder: {e}")
-                else:
-                    created_total, skipped_total, errors_total = 0, 0, 0
-                    created_paths: List[str] = []
-                    skipped_paths: List[str] = []
-                    # Save PDFs to temp and convert
-                    tmp_root = Path("data/uploads/pdf_tmp")
-                    tmp_root.mkdir(parents=True, exist_ok=True)
-                    for f in pdfs:
-                        try:
-                            tmp_path = tmp_root / _sanitize_filename(f.name)
-                            tmp_path.write_bytes(f.read())
-                            new, skipped, errs = convert_pdf_to_images(tmp_path, out_dir, dpi=dpi, fmt=fmt, overwrite=overwrite, page_spec=page_spec.strip() or None)
-                            created_total += len(new)
-                            skipped_total += len(skipped)
-                            errors_total += len(errs)
-                            created_paths.extend(new)
-                            skipped_paths.extend(skipped)
-                        except Exception as e:
-                            st.warning(f"{f.name}: {e}")
-                    # Update checkpoint for the folder
-                    cp = FolderCheckpoint(out_dir)
-                    cp.load()
-                    # Ensure entries for all images in the folder (created + skipped)
-                    imgs_in_folder = _find_images_in_folder(out_dir, True)
-                    cp.ensure_entries(imgs_in_folder)
-                    try:
-                        cp.save()
-                    except Exception:
-                        pass
-                    st.session_state["last_folder_path"] = str(out_dir)
-                    st.session_state["pdf_out_folder"] = str(out_dir)
-                    st.success(f"Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
-
-                    # Queue pending files only when requested
-                    if convert_and_queue:
-                        pending = cp.pending_files(imgs_in_folder)
-                        lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-                        selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
-                        added = 0
-                        for p in pending:
-                            if p not in lst:
-                                lst.append(p)
-                                added += 1
-                            if p not in selected_lst:
-                                selected_lst.append(p)
-                        st.info(f"Queued {added} pending page image(s)")
-                    # Quick checkpoint actions
-                    with st.expander("Checkpoint actions"):
-                        cpa1, cpa2, cpa3 = st.columns([1.2, 1.2, 1])
-                        with cpa1:
-                            if st.button("Resume pending", key="pdf_resume_pending"):
-                                pending = cp.pending_files(imgs_in_folder)
-                                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-                                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
-                                added = 0
-                                for p in pending:
-                                    if p not in lst:
-                                        lst.append(p)
-                                        added += 1
-                                    if p not in selected_lst:
-                                        selected_lst.append(p)
-                                st.success(f"✅ Added {added} pending page(s)")
-                                st.rerun()
-                        with cpa2:
-                            if st.button("Retry failed only", key="pdf_retry_failed"):
-                                failed = cp.failed_files(imgs_in_folder)
-                                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
-                                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
-                                added = 0
-                                for p in failed:
-                                    if p not in lst:
-                                        lst.append(p)
-                                        added += 1
-                                    if p not in selected_lst:
-                                        selected_lst.append(p)
-                                st.success(f"✅ Added {added} failed page(s)")
-                                st.rerun()
-                        with cpa3:
-                            if st.button("Reset checkpoint", key="pdf_reset_cp"):
-                                cp.reset()
-                                try:
-                                    cp.save()
-                                except Exception:
-                                    pass
-                                st.warning("Checkpoint reset for output folder")
     
     # Image Management (Simple List)
     imgs: List[str] = st.session_state.get("uploaded_images", [])
@@ -956,6 +841,10 @@ def run() -> None:
                 # record run context
                 try:
                     checkpoint.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                    # Set project context
+                    active_project = storage.get_active_project()
+                    if active_project:
+                        checkpoint.set_project_context(active_project.id, active_project.name)
                     checkpoint.save()
                 except Exception:
                     pass
@@ -977,9 +866,19 @@ def run() -> None:
                     unstructured=unstructured,
                 )
                 out = result.get("output")
+                usage = result.get("usage")
                 in_path = Path(img_path)
                 out_dir = in_path.parent
                 base_name = _guess_original_stem(in_path)
+                
+                # Update checkpoint stats with tokens and cost
+                if checkpoint is not None and usage:
+                    tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+                    tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+                    cost_info = cost_from_usage(usage, model_ctx.pricing)
+                    cost_usd = cost_info.get("total_usd", 0.0) if cost_info else 0.0
+                    checkpoint.update_processing_stats(tokens_in, tokens_out, cost_usd)
+                
                 if not out:
                     errors.append(f"No output for {in_path.name}")
                     if checkpoint is not None:
@@ -1053,6 +952,31 @@ def run() -> None:
             with st.expander("Errors encountered"):
                 for e in errors:
                     st.error(e)
+        
+        # Generate project report
+        active_project = storage.get_active_project()
+        if active_project and checkpoint:
+            st.markdown("### 📊 Project Report")
+            with st.spinner("Generating project report..."):
+                try:
+                    from app.core.report_generator import save_project_report
+                    export_dir = Path("export")
+                    report_path = save_project_report(active_project.id, export_dir, checkpoint_dir=base_folder if base_folder_raw else None)
+                    
+                    st.success(f"✅ Project report generated: `{report_path}`")
+                    
+                    # Offer download
+                    report_content = report_path.read_text(encoding="utf-8")
+                    st.download_button(
+                        "📥 Download Report",
+                        data=report_content,
+                        file_name=report_path.name,
+                        mime="text/markdown",
+                        key="download_project_report"
+                    )
+                except Exception as e:
+                    st.warning(f"Could not generate report: {e}")
+        
         # End per-file mode early to avoid aggregated rendering
         st.session_state['per_file_mode_active'] = False
         return
@@ -1077,6 +1001,10 @@ def run() -> None:
                     checkpoint2 = FolderCheckpoint(base_folder)
                     checkpoint2.load()
                     checkpoint2.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                    # Set project context
+                    active_project = storage.get_active_project()
+                    if active_project:
+                        checkpoint2.set_project_context(active_project.id, active_project.name)
                     checkpoint2.save()
                 except Exception:
                     pass

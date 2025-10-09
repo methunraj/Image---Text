@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, Iterable, Optional
+from typing import Any, Dict, Generator, Iterable, Optional
 
 from sqlalchemy import JSON, Float, ForeignKey, String, Boolean, create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
@@ -62,6 +62,18 @@ class ProviderKey(Base):
     created_at: Mapped[datetime] = mapped_column(default=func.now())
 
 
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(default=func.now(), onupdate=func.now())
+
+    runs: Mapped[list[Run]] = relationship(back_populates="project", cascade="all, delete-orphan")  # type: ignore[name-defined]
+
+
 class Template(Base):
     __tablename__ = "templates"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -86,6 +98,7 @@ class Run(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     provider_id: Mapped[int] = mapped_column(ForeignKey("providers.id"))
     template_id: Mapped[int | None] = mapped_column(ForeignKey("templates.id"), nullable=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
     input_images_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     output_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -94,6 +107,7 @@ class Run(Base):
 
     provider: Mapped[Provider] = relationship(back_populates="runs")
     template: Mapped[Template | None] = relationship(back_populates="runs")
+    project: Mapped[Project | None] = relationship(back_populates="runs")  # type: ignore[name-defined]
     tests: Mapped[list[Test]] = relationship(back_populates="run", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
 
@@ -136,7 +150,7 @@ def _run_migrations() -> None:
     with _engine.begin() as conn:
         def table_cols(name: str) -> set[str]:
             # Use parameterized query to avoid SQL injection
-            if name not in ("providers", "templates", "runs", "tests"):
+            if name not in ("providers", "templates", "runs", "tests", "projects"):
                 raise ValueError(f"Invalid table name: {name}")
             rows = conn.exec_driver_sql(f"PRAGMA table_info({name})").fetchall()
             return {r[1] for r in rows}  # type: ignore
@@ -180,6 +194,42 @@ def _run_migrations() -> None:
             if col not in cols_t:
                 # Column names and types are from hardcoded dict, safe from injection
                 conn.exec_driver_sql(f"ALTER TABLE templates ADD COLUMN {col} {typ}")
+
+        # Runs table new columns
+        cols_r = table_cols("runs")
+        if "project_id" not in cols_r:
+            conn.exec_driver_sql("ALTER TABLE runs ADD COLUMN project_id INTEGER")
+    
+    # Create Default Project if no projects exist and assign existing runs
+    _ensure_default_project()
+
+
+def _ensure_default_project() -> None:
+    """Create Default Project if no projects exist and assign existing runs to it."""
+    try:
+        with get_db() as db:
+            # Check if any projects exist
+            existing = db.query(Project).first()
+            if existing is None:
+                # Create default project
+                default_proj = Project(
+                    name="Default Project",
+                    description="Auto-created for existing runs",
+                    is_active=True
+                )
+                db.add(default_proj)
+                db.commit()
+                db.refresh(default_proj)
+                
+                # Assign all existing runs to default project
+                db.query(Run).filter(Run.project_id.is_(None)).update(
+                    {Run.project_id: default_proj.id},
+                    synchronize_session=False
+                )
+                db.commit()
+    except Exception:
+        # Ignore errors during migration (e.g., if tables don't exist yet)
+        pass
 
 
 def get_db() -> Session:
@@ -320,11 +370,26 @@ def delete_template(tid: int) -> None:
             db.commit()
 
 
-def record_run(provider_id: int, template_id: int | None, input_images: list | None, output: dict | None, cost_usd: float | None, status: str = "completed") -> Run:
+def record_run(
+    provider_id: int, 
+    template_id: int | None, 
+    input_images: list | None, 
+    output: dict | None, 
+    cost_usd: float | None, 
+    status: str = "completed",
+    project_id: int | None = None
+) -> Run:
     with get_db() as db:
+        # If no project_id provided, use active project
+        if project_id is None:
+            active_proj = get_active_project()
+            if active_proj:
+                project_id = active_proj.id
+        
         r = Run(
             provider_id=provider_id,
             template_id=template_id,
+            project_id=project_id,
             input_images_json=input_images or [],
             output_json=output or {},
             cost_usd=cost_usd,
@@ -495,3 +560,125 @@ def delete_provider_key(provider_code: str) -> None:
         if rec:
             db.delete(rec)
             db.commit()
+
+
+# --- Project Management ---
+def create_project(name: str, description: str | None = None) -> Project:
+    """Create a new project."""
+    with get_db() as db:
+        existing = db.query(Project).filter(Project.name == name).first()
+        if existing:
+            raise ValueError("Project name already exists")
+        
+        proj = Project(name=name, description=description, is_active=False)
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+        return proj
+
+
+def list_projects() -> list[Project]:
+    """List all projects ordered by creation date."""
+    with get_db() as db:
+        return db.query(Project).order_by(Project.created_at.desc()).all()
+
+
+def get_project_by_id(project_id: int) -> Project | None:
+    """Get project by ID."""
+    with get_db() as db:
+        return db.get(Project, project_id)
+
+
+def get_project_by_name(name: str) -> Project | None:
+    """Get project by name."""
+    with get_db() as db:
+        return db.query(Project).filter(Project.name == name).first()
+
+
+def get_active_project() -> Project | None:
+    """Get the currently active project."""
+    with get_db() as db:
+        return db.query(Project).filter(Project.is_active == True).first()  # noqa: E712
+
+
+def set_active_project(project_id: int) -> None:
+    """Set a project as active (deactivates all others)."""
+    with get_db() as db:
+        # Deactivate all projects
+        db.query(Project).update({Project.is_active: False})
+        
+        # Activate the selected project
+        proj = db.get(Project, project_id)
+        if not proj:
+            raise ValueError("Project not found")
+        proj.is_active = True
+        db.add(proj)
+        db.commit()
+
+
+def update_project(project_id: int, **fields) -> Project:
+    """Update project fields."""
+    with get_db() as db:
+        proj = db.get(Project, project_id)
+        if not proj:
+            raise ValueError("Project not found")
+        
+        # Enforce unique name if changed
+        new_name = fields.get("name")
+        if new_name and new_name != proj.name:
+            dup = db.query(Project).filter(Project.name == new_name).first()
+            if dup:
+                raise ValueError("Project name already exists")
+        
+        for k, v in fields.items():
+            if hasattr(proj, k):
+                setattr(proj, k, v)
+        
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+        return proj
+
+
+def delete_project(project_id: int) -> None:
+    """Delete a project if it has no runs."""
+    with get_db() as db:
+        proj = db.get(Project, project_id)
+        if not proj:
+            return
+        
+        # Check if project has runs
+        run_count = db.query(Run).filter(Run.project_id == project_id).count()
+        if run_count > 0:
+            raise ValueError(f"Cannot delete project with {run_count} run(s). Please reassign or delete the runs first.")
+        
+        # Don't delete if it's the only project
+        total_projects = db.query(Project).count()
+        if total_projects <= 1:
+            raise ValueError("Cannot delete the last project. Create another project first.")
+        
+        db.delete(proj)
+        db.commit()
+
+
+def get_project_stats(project_id: int) -> Dict[str, Any]:
+    """Get statistics for a project."""
+    with get_db() as db:
+        runs = db.query(Run).filter(Run.project_id == project_id).all()
+        
+        total_images = sum(len(r.input_images_json or []) for r in runs)
+        total_cost_usd = sum(r.cost_usd or 0.0 for r in runs)
+        
+        # Count unique models used
+        models_used = set()
+        for r in runs:
+            if r.provider and r.provider.model_id:
+                models_used.add(r.provider.model_id)
+        
+        return {
+            "total_runs": len(runs),
+            "total_images": total_images,
+            "total_cost_usd": total_cost_usd,
+            "avg_cost_per_image": (total_cost_usd / total_images if total_images > 0 else 0.0),
+            "models_used": list(models_used),
+        }
