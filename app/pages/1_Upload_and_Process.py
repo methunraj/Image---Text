@@ -946,8 +946,14 @@ def run() -> None:
             # Show info about cached results
             st.info(f"📋 Showing cached results from {int(time_ago/60)} minute(s) ago. Click 'Process' to refresh.")
     
+    # Handle automatic refresh after processing to update sidebar
+    show_processing_results = False
+    if st.session_state.get('_just_processed_refresh', False):
+        st.session_state['_just_processed_refresh'] = False
+        show_processing_results = True  # Show results even without button click
+    
     # Per-file mode: run one-by-one and save
-    if process_clicked and selected_template and per_file_mode:
+    if process_clicked and selected_template and per_file_mode and not show_processing_results:
         # Check if at least one format is selected
         if not any(save_formats.values()):
             st.error("⚠️ Please select at least one format to save before processing")
@@ -1004,10 +1010,7 @@ def run() -> None:
         
         # Store download data for uploaded files
         download_data = []  # List of (filename, format, bytes)
-        
-        # Track cumulative cost for display
-        cumulative_cost = 0.0
-        cost_display_placeholder = st.empty()
+        db_records_created = 0  # Track successful database recordings
         
         for idx, img_path in enumerate(selected, start=1):
             try:
@@ -1086,16 +1089,19 @@ def run() -> None:
                         
                         # Record run in database for project stats
                         try:
+                            cost_to_record = cost_usd if 'cost_usd' in locals() and cost_usd else None
                             storage.record_run(
                                 provider_id=model_ctx.provider_record.id,
                                 template_id=(getattr(selected_template, 'id', None) or None),
                                 input_images=[img_path],
                                 output={"raw_text": text},
-                                cost_usd=cost_usd if 'cost_usd' in locals() else None,
+                                cost_usd=cost_to_record,
                                 status="completed"
                             )
-                        except Exception:
-                            pass  # Don't fail processing if database recording fails
+                            db_records_created += 1
+                        except Exception as e:
+                            # Silent but log to errors for debugging
+                            errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
                     else:
                         recs = ensure_records(out)
                         cols = all_columns(recs)
@@ -1138,26 +1144,19 @@ def run() -> None:
                         
                         # Record run in database for project stats
                         try:
+                            cost_to_record = cost_usd if 'cost_usd' in locals() and cost_usd else None
                             storage.record_run(
                                 provider_id=model_ctx.provider_record.id,
                                 template_id=(getattr(selected_template, 'id', None) or None),
                                 input_images=[img_path],
                                 output=out,
-                                cost_usd=cost_usd if 'cost_usd' in locals() else None,
+                                cost_usd=cost_to_record,
                                 status="completed"
                             )
-                        except Exception:
-                            pass  # Don't fail processing if database recording fails
-                
-                # Update cumulative cost display
-                if 'cost_usd' in locals() and cost_usd:
-                    cumulative_cost += cost_usd
-                    with cost_display_placeholder.container():
-                        st.metric(
-                            label="💰 Running Total Cost",
-                            value=f"${cumulative_cost:.4f}",
-                            delta=f"+${cost_usd:.4f}"
-                        )
+                            db_records_created += 1
+                        except Exception as e:
+                            # Silent but log to errors for debugging
+                            errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
             except Exception as e:
                 errors.append(f"Save failed for {Path(img_path).name}: {e}")
                 if checkpoint is not None:
@@ -1170,7 +1169,6 @@ def run() -> None:
                     except Exception:
                         pass
         progress.empty()
-        cost_display_placeholder.empty()  # Clear the running cost display
 
         # Build success message and download buttons based on mode
         saved_msgs = []
@@ -1229,13 +1227,18 @@ def run() -> None:
                 for e in errors:
                     st.error(e)
         
-        # Show checkpoint information
+        # Show checkpoint and database information
+        st.success(f"✅ **Processing complete:** {len(selected) - len(errors)}/{len(selected)} files successful")
+        
+        if db_records_created > 0:
+            st.info(f"📊 **Database updated:** {db_records_created} runs recorded for project stats")
+        else:
+            st.warning("⚠️ **Database not updated:** No runs were recorded. Check errors below.")
+        
         if checkpoint is not None:
             checkpoint_stats = checkpoint.get_processing_stats()
             st.info(
-                f"📋 **Checkpoint saved:** {len(selected) - len(errors)} files processed, "
-                f"${checkpoint_stats.get('total_cost_usd', 0.0):.4f} total cost • "
-                f"Refresh page to see updated stats in sidebar"
+                f"📋 **Checkpoint saved:** ${checkpoint_stats.get('total_cost_usd', 0.0):.4f} total cost"
             )
             if is_folder_mode:
                 checkpoint_path = Path(_normalize_folder_input(base_folder_raw)).resolve() / ".img2json.checkpoint.json"
@@ -1287,8 +1290,116 @@ def run() -> None:
                 except Exception as e:
                     st.warning(f"Could not generate report: {e}")
         
+        # Store results in session state for display after refresh
+        st.session_state['_last_processing_results'] = {
+            'saved_msgs': saved_msgs,
+            'download_data': download_data,
+            'is_folder_mode': is_folder_mode,
+            'output_dir': str(output_dir) if output_dir else None,
+            'errors': errors,
+            'db_records_created': db_records_created,
+            'checkpoint_stats': checkpoint.get_processing_stats() if checkpoint else None,
+            'checkpoint_path': str(Path(_normalize_folder_input(base_folder_raw)).resolve() / ".img2json.checkpoint.json") if is_folder_mode and base_folder_raw else None,
+            'selected_count': len(selected),
+            'uploaded_files_to_clean': [img for img in selected if str(UPLOAD_DIR.resolve()) in img] if not is_folder_mode else []
+        }
+        
         # End per-file mode early to avoid aggregated rendering
         st.session_state['per_file_mode_active'] = False
+        
+        # Trigger automatic page refresh to update sidebar stats
+        st.session_state['_just_processed_refresh'] = True
+        st.rerun()
+        
+        return
+    
+    # Display stored results after refresh
+    if show_processing_results and '_last_processing_results' in st.session_state:
+        results = st.session_state['_last_processing_results']
+        
+        st.markdown("### Processing & Saving Per File")
+        st.markdown("---")
+        
+        # Build success message and download buttons based on mode
+        if results['is_folder_mode']:
+            # FOLDER MODE: Show save location
+            if results['saved_msgs']:
+                st.success(f"✅ Saved: {', '.join(results['saved_msgs'])} files to `{results['output_dir']}` directory")
+            else:
+                st.warning("⚠️ No files saved (no formats selected)")
+        else:
+            # UPLOAD MODE: Show download buttons
+            if results['download_data']:
+                st.success(f"✅ Processed {results['selected_count']} files. Download buttons below:")
+                st.markdown("### 📥 Download Processed Files")
+                
+                # Group downloads by filename
+                files_by_name = {}
+                for base_name, fmt, data in results['download_data']:
+                    if base_name not in files_by_name:
+                        files_by_name[base_name] = []
+                    files_by_name[base_name].append((fmt, data))
+                
+                # Create download buttons for each file
+                for base_name, formats in files_by_name.items():
+                    st.markdown(f"**{base_name}**")
+                    cols = st.columns(len(formats))
+                    for idx, (fmt, data) in enumerate(formats):
+                        with cols[idx]:
+                            ext_map = {'json': ('.json', 'application/json'),
+                                     'md': ('.md', 'text/markdown'),
+                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext, mime = ext_map[fmt]
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            st.download_button(
+                                label_map[fmt],
+                                data=data,
+                                file_name=f"{base_name}{ext}",
+                                mime=mime,
+                                key=f"download_refresh_{base_name}_{fmt}",
+                                use_container_width=True
+                            )
+                    st.divider()
+            else:
+                st.warning("⚠️ No files processed")
+        
+        if results['errors']:
+            with st.expander("Errors encountered"):
+                for e in results['errors']:
+                    st.error(e)
+        
+        # Show status messages
+        st.success(f"✅ **Processing complete:** {results['selected_count'] - len(results['errors'])}/{results['selected_count']} files successful")
+        
+        if results['db_records_created'] > 0:
+            st.info(f"📊 **Database updated:** {results['db_records_created']} runs recorded (sidebar stats refreshed!)")
+        else:
+            st.warning("⚠️ **Database not updated:** No runs were recorded. Check errors above.")
+        
+        if results['checkpoint_stats']:
+            st.info(f"📋 **Checkpoint saved:** ${results['checkpoint_stats'].get('total_cost_usd', 0.0):.4f} total cost")
+            if results['checkpoint_path']:
+                st.caption(f"📁 Checkpoint location: `{results['checkpoint_path']}`")
+        
+        # Cleanup uploaded files
+        if results['uploaded_files_to_clean']:
+            try:
+                for img_path in results['uploaded_files_to_clean']:
+                    Path(img_path).unlink(missing_ok=True)
+                st.caption(f"🗑️ Cleaned up {len(results['uploaded_files_to_clean'])} uploaded file(s)")
+            except Exception:
+                pass
+            
+            # Clear session state
+            if 'uploaded_images' in st.session_state:
+                remaining = [img for img in st.session_state['uploaded_images'] 
+                            if img not in results['uploaded_files_to_clean']]
+                st.session_state['uploaded_images'] = remaining
+                st.session_state['selected_images'] = []
+        
+        # Clear the stored results
+        del st.session_state['_last_processing_results']
+        
         return
 
     if process_clicked and selected_template:
