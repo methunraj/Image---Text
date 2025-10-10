@@ -20,8 +20,12 @@ from app.core.model_registry import ModelRegistryError, active_model, ensure_reg
 from app.core.models_dev import get_logo_path
 
 
-def _get_active_profile() -> tuple[str, str | None]:
-    """Resolve the active model/profile and logo from DB or env."""
+def _get_active_profile() -> tuple[str, str | None, str | None]:
+    """Resolve the active model/profile, logo, and provider_id from DB or env.
+    
+    Returns:
+        Tuple of (name, logo_path, provider_id)
+    """
     # Prefer an explicitly active provider saved in DB (from Settings)
     try:
         db_active = storage.get_active_provider()
@@ -34,28 +38,58 @@ def _get_active_profile() -> tuple[str, str | None]:
                 label_parts.append(db_active.model_id)
             composed = " • ".join(label_parts) if label_parts else (db_active.name or "Active Model")
             logo = db_active.logo_path
-            return composed, logo
+            provider_id = db_active.provider_code or "custom"
+            return composed, logo, provider_id
     except Exception:
         pass
     try:
         descriptor = active_model()
         name = descriptor.label
         logo = get_logo_path(descriptor.provider_id)
-        return name, logo
+        return name, logo, descriptor.provider_id
     except ModelRegistryError:
         pass
-    # fallback
-    profile = None
-    # Only read st.secrets if a secrets.toml exists to avoid noisy warnings
+    
+    # Fallback: Try to extract provider info from models.xlsx
+    profile_name = None
+    provider_id = None
+    model_name = None
+    
+    # Get profile from secrets or env
     project_secrets = _ROOT / ".streamlit" / "secrets.toml"
     user_secrets = Path.home() / ".streamlit" / "secrets.toml"
     if project_secrets.exists() or user_secrets.exists():
         try:
-            profile = st.secrets.get("APP_PROFILE")  # type: ignore[attr-defined]
+            profile_name = st.secrets.get("APP_PROFILE")  # type: ignore[attr-defined]
         except Exception:
-            profile = None
-    name = str(profile) if profile else os.getenv("APP_PROFILE", "Default")
-    return name, None
+            pass
+    if not profile_name:
+        profile_name = os.getenv("APP_PROFILE", "dev")
+    
+    # Try to read from models.xlsx to get provider info
+    try:
+        import pandas as pd
+        excel_path = Path("config/models.xlsx")
+        if excel_path.exists():
+            df = pd.read_excel(excel_path)
+            # Find row matching current profile
+            profile_row = df[df['profile'] == profile_name]
+            if not profile_row.empty:
+                provider_id = profile_row.iloc[0].get('default_provider')
+                default_model = profile_row.iloc[0].get('default_model')
+                if default_model:
+                    # Format model name nicely (gemini-2.5-flash -> Gemini 2.5 Flash)
+                    model_name = default_model.replace('-', ' ').replace('_', ' ').title()
+    except Exception:
+        pass
+    
+    # Compose display name
+    if model_name:
+        display_name = model_name
+    else:
+        display_name = str(profile_name) if profile_name else "Default"
+    
+    return display_name, None, provider_id
 
 
 def _ensure_runtime_dirs() -> None:
@@ -90,8 +124,9 @@ def main() -> None:
     with st.sidebar:
         st.markdown("#### Navigation")
         st.markdown("<hr>", unsafe_allow_html=True)
-        prof_name, logo = _get_active_profile()
-        core_ui.status_chip("Active Model", prof_name, logo_path=logo)
+        prof_name, logo, provider_id = _get_active_profile()
+        # Use auto-generated icon if no logo is available
+        core_ui.status_chip("Active Model", prof_name, logo_path=logo, provider_id=provider_id)
         
         # Project selector and money tracker
         st.markdown("---")
@@ -143,42 +178,63 @@ def main() -> None:
                     # Show currency rate badge
                     if usd_to_inr:
                         st.markdown(
-                            f'<div style="background-color: #d1fae5; color: #065f46; padding: 4px 8px; '
-                            f'border-radius: 4px; font-size: 0.75rem; margin-bottom: 8px; text-align: center;">'
+                            f'<div style="background-color: #d1fae5; color: #065f46; padding: 6px 10px; '
+                            f'border-radius: 6px; font-size: 0.8rem; margin: 12px 0; text-align: center; '
+                            f'font-weight: 500; border: 1px solid #a7f3d0;">'
                             f'💱 1 USD = ₹{usd_to_inr:.2f}'
                             f'</div>',
                             unsafe_allow_html=True
                         )
                     
-                    # Compact stats
+                    # Stats in clean columns
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.markdown(f"**Images**  \n{stats['total_images']}")
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">IMAGES</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_images"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
                     with col2:
-                        st.markdown(f"**Runs**  \n{stats['total_runs']}")
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">RUNS</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_runs"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
                     
-                    # Cost metrics - compact format
+                    # Total cost section
                     total_usd = stats['total_cost_usd']
+                    cost_html = '<div style="padding: 10px; background-color: #fef3c7; border-radius: 6px; border: 1px solid #fde68a; margin-top: 8px;">'
+                    cost_html += '<div style="font-size: 0.7rem; color: #92400e; font-weight: 500; margin-bottom: 4px;">TOTAL SPENT</div>'
+                    cost_html += f'<div style="font-size: 1.1rem; font-weight: 600; color: #78350f;">${total_usd:.4f}</div>'
+                    
                     if usd_to_inr:
                         total_inr = convert_usd_to_inr(total_usd, rate=usd_to_inr)
                         if total_inr is not None:
-                            st.markdown(f"**Total Spent**  \n${total_usd:.4f} • ₹{total_inr:.2f}")
-                        else:
-                            st.markdown(f"**Total Spent**  \n${total_usd:.4f}")
-                    else:
-                        st.markdown(f"**Total Spent**  \n${total_usd:.4f}")
+                            cost_html += f'<div style="font-size: 0.85rem; color: #92400e; margin-top: 2px;">₹{total_inr:.2f}</div>'
+                    
+                    cost_html += '</div>'
+                    st.markdown(cost_html, unsafe_allow_html=True)
                     
                     # Average per image - only show if there are images
                     if stats['total_images'] > 0:
                         avg_usd = total_usd / stats['total_images']
+                        avg_text = f"${avg_usd:.4f}"
                         if usd_to_inr:
                             avg_inr = convert_usd_to_inr(avg_usd, rate=usd_to_inr)
                             if avg_inr is not None:
-                                st.caption(f"Avg/Image: ${avg_usd:.4f} • ₹{avg_inr:.2f}")
-                            else:
-                                st.caption(f"Avg/Image: ${avg_usd:.4f}")
-                        else:
-                            st.caption(f"Avg/Image: ${avg_usd:.4f}")
+                                avg_text += f" • ₹{avg_inr:.4f}"
+                        st.markdown(
+                            f'<div style="text-align: center; font-size: 0.75rem; color: #6b7280; margin-top: 8px;">'
+                            f'Avg per image: {avg_text}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
         except Exception as e:
             st.error(f"Error loading projects: {e}")
 

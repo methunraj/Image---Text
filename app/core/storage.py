@@ -62,6 +62,14 @@ class ProviderKey(Base):
     created_at: Mapped[datetime] = mapped_column(default=func.now())
 
 
+class ProviderIcon(Base):
+    __tablename__ = "provider_icons"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    svg_content: Mapped[str] = mapped_column(nullable=False)  # Full SVG markup
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+
 class Project(Base):
     __tablename__ = "projects"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -682,3 +690,76 @@ def get_project_stats(project_id: int) -> Dict[str, Any]:
             "avg_cost_per_image": (total_cost_usd / total_images if total_images > 0 else 0.0),
             "models_used": list(models_used),
         }
+
+
+# ============================================================================
+# Provider Icons (LLM-generated SVG icons)
+# ============================================================================
+
+def get_provider_icon(provider_code: str) -> str | None:
+    """Retrieve cached SVG icon for a provider.
+    
+    Args:
+        provider_code: Provider identifier (e.g., 'openai', 'anthropic')
+    
+    Returns:
+        SVG content string or None if not found
+    """
+    with get_db() as db:
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        return icon.svg_content if icon else None
+
+
+def save_provider_icon(provider_code: str, svg_content: str) -> ProviderIcon:
+    """Store generated SVG icon for a provider.
+    
+    Args:
+        provider_code: Provider identifier
+        svg_content: Full SVG markup
+    
+    Returns:
+        Created or updated ProviderIcon instance
+    """
+    with get_db() as db:
+        # Check if already exists
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        
+        if icon:
+            # Update existing
+            icon.svg_content = svg_content
+        else:
+            # Create new
+            icon = ProviderIcon(provider_code=provider_code, svg_content=svg_content)
+            db.add(icon)
+        
+        db.commit()
+        db.refresh(icon)
+        return icon
+
+
+def delete_provider_icon(provider_code: str) -> bool:
+    """Delete cached icon for a provider (to trigger regeneration).
+    
+    Args:
+        provider_code: Provider identifier
+    
+    Returns:
+        True if deleted, False if not found
+    """
+    with get_db() as db:
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        if icon:
+            db.delete(icon)
+            db.commit()
+            return True
+        return False
+
+
+def list_provider_icons() -> list[ProviderIcon]:
+    """List all cached provider icons.
+    
+    Returns:
+        List of ProviderIcon instances
+    """
+    with get_db() as db:
+        return db.query(ProviderIcon).order_by(ProviderIcon.created_at.desc()).all()
