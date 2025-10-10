@@ -22,6 +22,7 @@ if str(_ROOT) not in sys.path:
 from app.core import storage
 from app.core import template_assets
 from app.core.cost import cost_from_usage
+from app.core.currency import get_usd_to_inr, convert_usd_to_inr
 from app.core.json_enforcer import strip_code_fences
 from app.core.model_registry import ModelRegistryError, ModelDescriptor, ensure_registry, active_model
 from app.core.provider_openai import gateway_from_descriptor
@@ -209,6 +210,22 @@ def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
     return saved
 
 
+def _cleanup_uploaded_files() -> None:
+    """Remove all uploaded image files from data/uploads/ directory.
+    Preserves the uploads directory and pdf_tmp subdirectory structure.
+    """
+    try:
+        if UPLOAD_DIR.exists():
+            for item in UPLOAD_DIR.iterdir():
+                if item.is_file() and item.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                    try:
+                        item.unlink()
+                    except Exception:
+                        pass  # Skip files that can't be deleted
+    except Exception:
+        pass  # Fail silently if directory doesn't exist or can't be accessed
+
+
 def _image_capable() -> bool:
     """Check if active provider supports images."""
     try:
@@ -352,6 +369,120 @@ def run() -> None:
     storage.init_db()
     template_assets.sync_from_assets()
     _ensure_dirs()
+    
+    # Clean up uploaded files from previous sessions
+    _cleanup_uploaded_files()
+    
+    # Sidebar: Project stats and cost tracking
+    with st.sidebar:
+        st.markdown("#### 📁 Active Project")
+        
+        try:
+            projects = storage.list_projects()
+            if not projects:
+                # Initialize with default project if none exist
+                storage.init_db()
+                projects = storage.list_projects()
+            
+            if projects:
+                active_project = storage.get_active_project()
+                project_names = [p.name for p in projects]
+                
+                # If no active project, set the first one as active
+                if not active_project and projects:
+                    storage.set_active_project(projects[0].id)
+                    active_project = projects[0]
+                
+                current_index = 0
+                if active_project and active_project.name in project_names:
+                    current_index = project_names.index(active_project.name)
+                
+                selected = st.selectbox(
+                    "Select Project",
+                    options=project_names,
+                    index=current_index,
+                    key="upload_page_project_selector",
+                    label_visibility="collapsed"
+                )
+                
+                # Switch project if selection changed
+                if active_project and selected != active_project.name:
+                    new_proj = next((p for p in projects if p.name == selected), None)
+                    if new_proj:
+                        storage.set_active_project(new_proj.id)
+                        st.rerun()
+                
+                # Show project stats
+                if active_project:
+                    stats = storage.get_project_stats(active_project.id)
+                    
+                    # Get currency rate for INR display
+                    usd_to_inr = get_usd_to_inr()
+                    
+                    # Show currency rate badge
+                    if usd_to_inr:
+                        st.markdown(
+                            f'<div style="background-color: #d1fae5; color: #065f46; padding: 6px 10px; '
+                            f'border-radius: 6px; font-size: 0.8rem; margin: 12px 0; text-align: center; '
+                            f'font-weight: 500; border: 1px solid #a7f3d0;">'
+                            f'💱 1 USD = ₹{usd_to_inr:.2f}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Stats in clean columns
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">IMAGES</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_images"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    with col2:
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">RUNS</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_runs"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Total cost section
+                    total_usd = stats['total_cost_usd']
+                    cost_html = '<div style="padding: 10px; background-color: #fef3c7; border-radius: 6px; border: 1px solid #fde68a; margin-top: 8px;">'
+                    cost_html += '<div style="font-size: 0.7rem; color: #92400e; font-weight: 500; margin-bottom: 4px;">TOTAL SPENT</div>'
+                    cost_html += f'<div style="font-size: 1.1rem; font-weight: 600; color: #78350f;">${total_usd:.4f}</div>'
+                    
+                    if usd_to_inr:
+                        total_inr = convert_usd_to_inr(total_usd, rate=usd_to_inr)
+                        if total_inr is not None:
+                            cost_html += f'<div style="font-size: 0.85rem; color: #92400e; margin-top: 2px;">₹{total_inr:.2f}</div>'
+                    
+                    cost_html += '</div>'
+                    st.markdown(cost_html, unsafe_allow_html=True)
+                    
+                    # Average per image - only show if there are images
+                    if stats['total_images'] > 0:
+                        avg_usd = total_usd / stats['total_images']
+                        avg_text = f"${avg_usd:.4f}"
+                        if usd_to_inr:
+                            avg_inr = convert_usd_to_inr(avg_usd, rate=usd_to_inr)
+                            if avg_inr is not None:
+                                avg_text += f" • ₹{avg_inr:.4f}"
+                        st.markdown(
+                            f'<div style="text-align: center; font-size: 0.75rem; color: #6b7280; margin-top: 8px;">'
+                            f'Avg per image: {avg_text}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+        except Exception as e:
+            st.error(f"Error loading projects: {e}")
+        
+        st.markdown("---")
     
     # Check capabilities
     if not _image_capable():
@@ -729,7 +860,6 @@ def run() -> None:
             st.write(f"**Price (input/output per 1M):** {in_display} / {out_display}")
         # Show INR per 1M if exchange rate available
         try:
-            from app.core.currency import get_usd_to_inr
             rate = get_usd_to_inr()
             if rate and (per_million_in is not None or per_million_out is not None):
                 in_inr = f"₹{(per_million_in * rate):.2f}" if per_million_in is not None else "—"
@@ -830,27 +960,51 @@ def run() -> None:
         saved_counts = {"json": 0, "md": 0, "docx": 0}
         errors: List[str] = []
         st.session_state['per_file_mode_active'] = True
-        # Prepare checkpoint if last_folder_path set
+        # Prepare checkpoint (works for both folder-based and uploaded files)
         checkpoint: FolderCheckpoint | None = None
         base_folder_raw = st.session_state.get("last_folder_path")
-        if base_folder_raw:
-            try:
+        
+        try:
+            if base_folder_raw:
+                # Folder-based processing
                 base_folder = Path(_normalize_folder_input(base_folder_raw)).resolve()
-                checkpoint = FolderCheckpoint(base_folder)
-                checkpoint.load()
-                # record run context
-                try:
-                    checkpoint.set_run_context(selected_template_name or None, descriptor.id, unstructured)
-                    # Set project context
-                    active_project = storage.get_active_project()
-                    if active_project:
-                        checkpoint.set_project_context(active_project.id, active_project.name)
-                    checkpoint.save()
-                except Exception:
-                    pass
+            else:
+                # Uploaded files - use upload directory
+                base_folder = UPLOAD_DIR.resolve()
+            
+            checkpoint = FolderCheckpoint(base_folder)
+            checkpoint.load()
+            # record run context
+            try:
+                checkpoint.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                # Set project context
+                active_project = storage.get_active_project()
+                if active_project:
+                    checkpoint.set_project_context(active_project.id, active_project.name)
+                checkpoint.save()
             except Exception:
-                checkpoint = None
+                pass
+        except Exception:
+            checkpoint = None
 
+        # Detect processing mode: folder-based or uploaded files
+        is_folder_mode = bool(base_folder_raw)
+        
+        # For folder mode, create output directory
+        output_dir = None
+        if is_folder_mode:
+            try:
+                source_folder = Path(_normalize_folder_input(base_folder_raw)).resolve()
+                output_dir = source_folder / "output"
+                output_dir.mkdir(exist_ok=True)
+                st.caption(f"📁 Output directory: {output_dir}")
+            except Exception as e:
+                st.error(f"Failed to create output directory: {e}")
+                return
+        
+        # Store download data for uploaded files
+        download_data = []  # List of (filename, format, bytes)
+        
         for idx, img_path in enumerate(selected, start=1):
             try:
                 per_file_gateway = gateway_from_descriptor(descriptor)
@@ -868,7 +1022,6 @@ def run() -> None:
                 out = result.get("output")
                 usage = result.get("usage")
                 in_path = Path(img_path)
-                out_dir = in_path.parent
                 base_name = _guess_original_stem(in_path)
                 
                 # Update checkpoint stats with tokens and cost
@@ -885,41 +1038,84 @@ def run() -> None:
                         checkpoint.mark_failed(img_path, "No output")
                 else:
                     saved_files = {}
+                    
                     if unstructured and isinstance(out, dict) and 'raw_text' in out:
                         text = str(out.get('raw_text') or "")
-                        # Save only selected formats
-                        if save_formats.get('md', False):
-                            (out_dir / f"{base_name}.md").write_bytes((text or "").encode("utf-8"))
-                            saved_files['md'] = str(out_dir / f"{base_name}.md")
-                            saved_counts['md'] += 1
-                        if save_formats.get('docx', False):
-                            docx_bytes = to_docx_from_text_bytes(text, title=base_name)
-                            (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
-                            saved_files['docx'] = str(out_dir / f"{base_name}.docx")
-                            saved_counts['docx'] += 1
-                        if save_formats.get('json', False):
-                            recs = ensure_records({"raw_text": text})
-                            (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
-                            saved_files['json'] = str(out_dir / f"{base_name}.json")
-                            saved_counts['json'] += 1
+                        
+                        # Process formats based on mode
+                        if is_folder_mode:
+                            # FOLDER MODE: Save to output/ directory
+                            if save_formats.get('md', False):
+                                md_bytes = (text or "").encode("utf-8")
+                                (output_dir / f"{base_name}.md").write_bytes(md_bytes)
+                                saved_files['md'] = str(output_dir / f"{base_name}.md")
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                                (output_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                                saved_files['docx'] = str(output_dir / f"{base_name}.docx")
+                                saved_counts['docx'] += 1
+                            if save_formats.get('json', False):
+                                recs = ensure_records({"raw_text": text})
+                                json_bytes = to_json_bytes(recs)
+                                (output_dir / f"{base_name}.json").write_bytes(json_bytes)
+                                saved_files['json'] = str(output_dir / f"{base_name}.json")
+                                saved_counts['json'] += 1
+                        else:
+                            # UPLOAD MODE: Prepare for download
+                            if save_formats.get('md', False):
+                                md_bytes = (text or "").encode("utf-8")
+                                download_data.append((base_name, 'md', md_bytes))
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                                download_data.append((base_name, 'docx', docx_bytes))
+                                saved_counts['docx'] += 1
+                            if save_formats.get('json', False):
+                                recs = ensure_records({"raw_text": text})
+                                json_bytes = to_json_bytes(recs)
+                                download_data.append((base_name, 'json', json_bytes))
+                                saved_counts['json'] += 1
+                        
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
                     else:
                         recs = ensure_records(out)
                         cols = all_columns(recs)
-                        # Save only selected formats
-                        if save_formats.get('json', False):
-                            (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
-                            saved_files['json'] = str(out_dir / f"{base_name}.json")
-                            saved_counts['json'] += 1
-                        if save_formats.get('md', False):
-                            (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
-                            saved_files['md'] = str(out_dir / f"{base_name}.md")
-                            saved_counts['md'] += 1
-                        if save_formats.get('docx', False):
-                            (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
-                            saved_files['docx'] = str(out_dir / f"{base_name}.docx")
-                            saved_counts['docx'] += 1
+                        
+                        # Process formats based on mode
+                        if is_folder_mode:
+                            # FOLDER MODE: Save to output/ directory
+                            if save_formats.get('json', False):
+                                json_bytes = to_json_bytes(recs)
+                                (output_dir / f"{base_name}.json").write_bytes(json_bytes)
+                                saved_files['json'] = str(output_dir / f"{base_name}.json")
+                                saved_counts['json'] += 1
+                            if save_formats.get('md', False):
+                                md_bytes = to_markdown_bytes(recs, cols)
+                                (output_dir / f"{base_name}.md").write_bytes(md_bytes)
+                                saved_files['md'] = str(output_dir / f"{base_name}.md")
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_bytes(recs, cols)
+                                (output_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                                saved_files['docx'] = str(output_dir / f"{base_name}.docx")
+                                saved_counts['docx'] += 1
+                        else:
+                            # UPLOAD MODE: Prepare for download
+                            if save_formats.get('json', False):
+                                json_bytes = to_json_bytes(recs)
+                                download_data.append((base_name, 'json', json_bytes))
+                                saved_counts['json'] += 1
+                            if save_formats.get('md', False):
+                                md_bytes = to_markdown_bytes(recs, cols)
+                                download_data.append((base_name, 'md', md_bytes))
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_bytes(recs, cols)
+                                download_data.append((base_name, 'docx', docx_bytes))
+                                saved_counts['docx'] += 1
+                        
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
             except Exception as e:
@@ -935,7 +1131,7 @@ def run() -> None:
                         pass
         progress.empty()
 
-        # Build success message showing only selected formats
+        # Build success message and download buttons based on mode
         saved_msgs = []
         if save_formats.get('json', False):
             saved_msgs.append(f"{saved_counts['json']} JSON")
@@ -944,14 +1140,73 @@ def run() -> None:
         if save_formats.get('docx', False):
             saved_msgs.append(f"{saved_counts['docx']} Word")
 
-        if saved_msgs:
-            st.success(f"✅ Saved: {', '.join(saved_msgs)} files next to inputs")
+        if is_folder_mode:
+            # FOLDER MODE: Show save location
+            if saved_msgs:
+                st.success(f"✅ Saved: {', '.join(saved_msgs)} files to `{output_dir}` directory")
+            else:
+                st.warning("⚠️ No files saved (no formats selected)")
         else:
-            st.warning("⚠️ No files saved (no formats selected)")
+            # UPLOAD MODE: Show download buttons
+            if download_data:
+                st.success(f"✅ Processed {len(selected)} files. Download buttons below:")
+                st.markdown("### 📥 Download Processed Files")
+                
+                # Group downloads by filename
+                files_by_name = {}
+                for base_name, fmt, data in download_data:
+                    if base_name not in files_by_name:
+                        files_by_name[base_name] = []
+                    files_by_name[base_name].append((fmt, data))
+                
+                # Create download buttons for each file
+                for base_name, formats in files_by_name.items():
+                    st.markdown(f"**{base_name}**")
+                    cols = st.columns(len(formats))
+                    for idx, (fmt, data) in enumerate(formats):
+                        with cols[idx]:
+                            # Map format to extension and MIME type
+                            ext_map = {'json': ('.json', 'application/json'),
+                                     'md': ('.md', 'text/markdown'),
+                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext, mime = ext_map[fmt]
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            st.download_button(
+                                label_map[fmt],
+                                data=data,
+                                file_name=f"{base_name}{ext}",
+                                mime=mime,
+                                key=f"download_{base_name}_{fmt}",
+                                use_container_width=True
+                            )
+                    st.divider()
+            else:
+                st.warning("⚠️ No files processed")
+        
         if errors:
             with st.expander("Errors encountered"):
                 for e in errors:
                     st.error(e)
+        
+        # Cleanup uploaded files after successful processing in upload mode
+        if not is_folder_mode:
+            # Store list of uploaded files to clean
+            uploaded_files_to_clean = [img for img in selected if str(UPLOAD_DIR.resolve()) in img]
+            if uploaded_files_to_clean:
+                try:
+                    for img_path in uploaded_files_to_clean:
+                        Path(img_path).unlink(missing_ok=True)
+                    st.caption(f"🗑️ Cleaned up {len(uploaded_files_to_clean)} uploaded file(s)")
+                except Exception:
+                    pass  # Silent failure
+            
+            # Clear session state after cleanup
+            if 'uploaded_images' in st.session_state:
+                # Remove only the files that were processed
+                remaining = [img for img in st.session_state['uploaded_images'] 
+                            if img not in uploaded_files_to_clean]
+                st.session_state['uploaded_images'] = remaining
+                st.session_state['selected_images'] = []
         
         # Generate project report
         active_project = storage.get_active_project()
@@ -961,7 +1216,9 @@ def run() -> None:
                 try:
                     from app.core.report_generator import save_project_report
                     export_dir = Path("export")
-                    report_path = save_project_report(active_project.id, export_dir, checkpoint_dir=base_folder if base_folder_raw else None)
+                    # Use source folder for folder mode, None for upload mode
+                    checkpoint_dir = Path(_normalize_folder_input(base_folder_raw)).resolve() if base_folder_raw else None
+                    report_path = save_project_report(active_project.id, export_dir, checkpoint_dir=checkpoint_dir)
                     
                     st.success(f"✅ Project report generated: `{report_path}`")
                     
@@ -1297,13 +1554,11 @@ def run() -> None:
                     
                     # Calculate cost if pricing available
                     if model_ctx.pricing:
-                        from app.core.cost import cost_from_usage
                         cost_info = cost_from_usage(usage_data, model_ctx.pricing)
                         total_cost = cost_info.get("total_usd") if cost_info else None
                         if total_cost:
                             # USD + INR (if available)
                             try:
-                                from app.core.currency import convert_usd_to_inr, get_usd_to_inr
                                 rate = get_usd_to_inr()
                                 if rate:
                                     inr = convert_usd_to_inr(float(total_cost), rate=rate)
