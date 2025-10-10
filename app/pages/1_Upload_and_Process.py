@@ -1005,6 +1005,10 @@ def run() -> None:
         # Store download data for uploaded files
         download_data = []  # List of (filename, format, bytes)
         
+        # Track cumulative cost for display
+        cumulative_cost = 0.0
+        cost_display_placeholder = st.empty()
+        
         for idx, img_path in enumerate(selected, start=1):
             try:
                 per_file_gateway = gateway_from_descriptor(descriptor)
@@ -1079,6 +1083,19 @@ def run() -> None:
                         
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
+                        
+                        # Record run in database for project stats
+                        try:
+                            storage.record_run(
+                                provider_id=model_ctx.provider_record.id,
+                                template_id=(getattr(selected_template, 'id', None) or None),
+                                input_images=[img_path],
+                                output={"raw_text": text},
+                                cost_usd=cost_usd if 'cost_usd' in locals() else None,
+                                status="completed"
+                            )
+                        except Exception:
+                            pass  # Don't fail processing if database recording fails
                     else:
                         recs = ensure_records(out)
                         cols = all_columns(recs)
@@ -1118,6 +1135,29 @@ def run() -> None:
                         
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
+                        
+                        # Record run in database for project stats
+                        try:
+                            storage.record_run(
+                                provider_id=model_ctx.provider_record.id,
+                                template_id=(getattr(selected_template, 'id', None) or None),
+                                input_images=[img_path],
+                                output=out,
+                                cost_usd=cost_usd if 'cost_usd' in locals() else None,
+                                status="completed"
+                            )
+                        except Exception:
+                            pass  # Don't fail processing if database recording fails
+                
+                # Update cumulative cost display
+                if 'cost_usd' in locals() and cost_usd:
+                    cumulative_cost += cost_usd
+                    with cost_display_placeholder.container():
+                        st.metric(
+                            label="💰 Running Total Cost",
+                            value=f"${cumulative_cost:.4f}",
+                            delta=f"+${cost_usd:.4f}"
+                        )
             except Exception as e:
                 errors.append(f"Save failed for {Path(img_path).name}: {e}")
                 if checkpoint is not None:
@@ -1130,6 +1170,7 @@ def run() -> None:
                     except Exception:
                         pass
         progress.empty()
+        cost_display_placeholder.empty()  # Clear the running cost display
 
         # Build success message and download buttons based on mode
         saved_msgs = []
@@ -1187,6 +1228,18 @@ def run() -> None:
             with st.expander("Errors encountered"):
                 for e in errors:
                     st.error(e)
+        
+        # Show checkpoint information
+        if checkpoint is not None:
+            checkpoint_stats = checkpoint.get_processing_stats()
+            st.info(
+                f"📋 **Checkpoint saved:** {len(selected) - len(errors)} files processed, "
+                f"${checkpoint_stats.get('total_cost_usd', 0.0):.4f} total cost • "
+                f"Refresh page to see updated stats in sidebar"
+            )
+            if is_folder_mode:
+                checkpoint_path = Path(_normalize_folder_input(base_folder_raw)).resolve() / ".img2json.checkpoint.json"
+                st.caption(f"📁 Checkpoint location: `{checkpoint_path}`")
         
         # Cleanup uploaded files after successful processing in upload mode
         if not is_folder_mode:
