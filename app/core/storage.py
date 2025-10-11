@@ -5,10 +5,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, Iterable, Optional
+from typing import Any, Dict, Generator, Iterable, Optional
 
 from sqlalchemy import JSON, Float, ForeignKey, String, Boolean, create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
+
+from app.core.model_registry import ModelDescriptor
 
 DB_PATH = Path("data/app.db")
 
@@ -60,6 +62,26 @@ class ProviderKey(Base):
     created_at: Mapped[datetime] = mapped_column(default=func.now())
 
 
+class ProviderIcon(Base):
+    __tablename__ = "provider_icons"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    svg_content: Mapped[str] = mapped_column(nullable=False)  # Full SVG markup
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+
+class Project(Base):
+    __tablename__ = "projects"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(default=func.now(), onupdate=func.now())
+
+    runs: Mapped[list[Run]] = relationship(back_populates="project", cascade="all, delete-orphan")  # type: ignore[name-defined]
+
+
 class Template(Base):
     __tablename__ = "templates"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -72,6 +94,7 @@ class Template(Base):
     examples_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     yaml_blob: Mapped[str | None] = mapped_column(nullable=True)
     version_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
     updated_at: Mapped[datetime] = mapped_column(default=func.now(), onupdate=func.now())
 
@@ -83,6 +106,7 @@ class Run(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     provider_id: Mapped[int] = mapped_column(ForeignKey("providers.id"))
     template_id: Mapped[int | None] = mapped_column(ForeignKey("templates.id"), nullable=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id"), nullable=True)
     input_images_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     output_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -91,6 +115,7 @@ class Run(Base):
 
     provider: Mapped[Provider] = relationship(back_populates="runs")
     template: Mapped[Template | None] = relationship(back_populates="runs")
+    project: Mapped[Project | None] = relationship(back_populates="runs")  # type: ignore[name-defined]
     tests: Mapped[list[Test]] = relationship(back_populates="run", cascade="all, delete-orphan")  # type: ignore[name-defined]
 
 
@@ -133,7 +158,7 @@ def _run_migrations() -> None:
     with _engine.begin() as conn:
         def table_cols(name: str) -> set[str]:
             # Use parameterized query to avoid SQL injection
-            if name not in ("providers", "templates", "runs", "tests"):
+            if name not in ("providers", "templates", "runs", "tests", "projects"):
                 raise ValueError(f"Invalid table name: {name}")
             rows = conn.exec_driver_sql(f"PRAGMA table_info({name})").fetchall()
             return {r[1] for r in rows}  # type: ignore
@@ -171,11 +196,48 @@ def _run_migrations() -> None:
             "user_prompt": "TEXT",
             "yaml_blob": "TEXT",
             "version_tag": "TEXT",
+            "source_path": "TEXT",
         }
         for col, typ in add_map_t.items():
             if col not in cols_t:
                 # Column names and types are from hardcoded dict, safe from injection
                 conn.exec_driver_sql(f"ALTER TABLE templates ADD COLUMN {col} {typ}")
+
+        # Runs table new columns
+        cols_r = table_cols("runs")
+        if "project_id" not in cols_r:
+            conn.exec_driver_sql("ALTER TABLE runs ADD COLUMN project_id INTEGER")
+    
+    # Create Default Project if no projects exist and assign existing runs
+    _ensure_default_project()
+
+
+def _ensure_default_project() -> None:
+    """Create Default Project if no projects exist and assign existing runs to it."""
+    try:
+        with get_db() as db:
+            # Check if any projects exist
+            existing = db.query(Project).first()
+            if existing is None:
+                # Create default project
+                default_proj = Project(
+                    name="Default Project",
+                    description="Auto-created for existing runs",
+                    is_active=True
+                )
+                db.add(default_proj)
+                db.commit()
+                db.refresh(default_proj)
+                
+                # Assign all existing runs to default project
+                db.query(Run).filter(Run.project_id.is_(None)).update(
+                    {Run.project_id: default_proj.id},
+                    synchronize_session=False
+                )
+                db.commit()
+    except Exception:
+        # Ignore errors during migration (e.g., if tables don't exist yet)
+        pass
 
 
 def get_db() -> Session:
@@ -247,9 +309,32 @@ def list_providers() -> list[Provider]:
         return db.query(Provider).order_by(Provider.name.asc()).all()
 
 
-def create_template(name: str, content: str, schema_json: dict | None = None, examples_json: list | None = None) -> Template:
+def create_template(
+    name: str,
+    content: str = "",
+    *,
+    description: str | None = None,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
+    schema_json: dict | None = None,
+    examples_json: list | None = None,
+    yaml_blob: str | None = None,
+    version_tag: str | None = None,
+    source_path: str | None = None,
+) -> Template:
     with get_db() as db:
-        t = Template(name=name, content=content, schema_json=schema_json or {}, examples_json=examples_json or [])
+        t = Template(
+            name=name,
+            content=content,
+            description=description,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_json=schema_json or {},
+            examples_json=examples_json or [],
+            yaml_blob=yaml_blob,
+            version_tag=version_tag,
+            source_path=source_path,
+        )
         db.add(t)
         db.commit()
         db.refresh(t)
@@ -293,11 +378,26 @@ def delete_template(tid: int) -> None:
             db.commit()
 
 
-def record_run(provider_id: int, template_id: int | None, input_images: list | None, output: dict | None, cost_usd: float | None, status: str = "completed") -> Run:
+def record_run(
+    provider_id: int, 
+    template_id: int | None, 
+    input_images: list | None, 
+    output: dict | None, 
+    cost_usd: float | None, 
+    status: str = "completed",
+    project_id: int | None = None
+) -> Run:
     with get_db() as db:
+        # If no project_id provided, use active project
+        if project_id is None:
+            active_proj = get_active_project()
+            if active_proj:
+                project_id = active_proj.id
+        
         r = Run(
             provider_id=provider_id,
             template_id=template_id,
+            project_id=project_id,
             input_images_json=input_images or [],
             output_json=output or {},
             cost_usd=cost_usd,
@@ -307,6 +407,60 @@ def record_run(provider_id: int, template_id: int | None, input_images: list | N
         db.commit()
         db.refresh(r)
         return r
+
+
+def ensure_registry_provider(descriptor: ModelDescriptor) -> Provider:
+    """Ensure a database provider row exists for registry-backed descriptors."""
+    name = f"Registry::{descriptor.provider_id}:{descriptor.id}"
+    caps_dump = descriptor.capabilities.model_dump()
+    headers = descriptor.extra_headers()
+
+    with get_db() as db:
+        provider = (
+            db.query(Provider)
+            .filter(Provider.provider_code == descriptor.provider_id, Provider.model_id == descriptor.id)
+            .first()
+        )
+
+        if not provider:
+            provider = Provider(
+                name=name,
+                base_url=descriptor.base_url,
+                provider_code=descriptor.provider_id,
+                model_id=descriptor.id,
+                key_storage="encrypted",
+                api_key_enc=None,
+                headers_json=headers or {},
+                timeout_s=descriptor.timeouts.total_s,
+                catalog_caps_json=caps_dump,
+                detected_caps_json=caps_dump,
+                default_temperature=descriptor.default_temperature,
+                default_top_p=descriptor.default_top_p,
+                default_max_output_tokens=descriptor.max_output_tokens,
+                default_force_json_mode=descriptor.force_json_mode,
+                default_prefer_tools=descriptor.prefer_tools,
+                is_active=True,
+            )
+            db.add(provider)
+        else:
+            provider.name = name
+            provider.base_url = descriptor.base_url
+            provider.provider_code = descriptor.provider_id
+            provider.model_id = descriptor.id
+            provider.headers_json = headers or {}
+            provider.timeout_s = descriptor.timeouts.total_s
+            provider.catalog_caps_json = caps_dump
+            provider.detected_caps_json = caps_dump
+            provider.default_temperature = descriptor.default_temperature
+            provider.default_top_p = descriptor.default_top_p
+            provider.default_max_output_tokens = descriptor.max_output_tokens
+            provider.default_force_json_mode = descriptor.force_json_mode
+            provider.default_prefer_tools = descriptor.prefer_tools
+            provider.is_active = True
+
+        db.commit()
+        db.refresh(provider)
+        return provider
 
 
 def list_runs(limit: int = 50) -> list[Run]:
@@ -414,3 +568,198 @@ def delete_provider_key(provider_code: str) -> None:
         if rec:
             db.delete(rec)
             db.commit()
+
+
+# --- Project Management ---
+def create_project(name: str, description: str | None = None) -> Project:
+    """Create a new project."""
+    with get_db() as db:
+        existing = db.query(Project).filter(Project.name == name).first()
+        if existing:
+            raise ValueError("Project name already exists")
+        
+        proj = Project(name=name, description=description, is_active=False)
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+        return proj
+
+
+def list_projects() -> list[Project]:
+    """List all projects ordered by creation date."""
+    with get_db() as db:
+        return db.query(Project).order_by(Project.created_at.desc()).all()
+
+
+def get_project_by_id(project_id: int) -> Project | None:
+    """Get project by ID."""
+    with get_db() as db:
+        return db.get(Project, project_id)
+
+
+def get_project_by_name(name: str) -> Project | None:
+    """Get project by name."""
+    with get_db() as db:
+        return db.query(Project).filter(Project.name == name).first()
+
+
+def get_active_project() -> Project | None:
+    """Get the currently active project."""
+    with get_db() as db:
+        return db.query(Project).filter(Project.is_active == True).first()  # noqa: E712
+
+
+def set_active_project(project_id: int) -> None:
+    """Set a project as active (deactivates all others)."""
+    with get_db() as db:
+        # Deactivate all projects
+        db.query(Project).update({Project.is_active: False})
+        
+        # Activate the selected project
+        proj = db.get(Project, project_id)
+        if not proj:
+            raise ValueError("Project not found")
+        proj.is_active = True
+        db.add(proj)
+        db.commit()
+
+
+def update_project(project_id: int, **fields) -> Project:
+    """Update project fields."""
+    with get_db() as db:
+        proj = db.get(Project, project_id)
+        if not proj:
+            raise ValueError("Project not found")
+        
+        # Enforce unique name if changed
+        new_name = fields.get("name")
+        if new_name and new_name != proj.name:
+            dup = db.query(Project).filter(Project.name == new_name).first()
+            if dup:
+                raise ValueError("Project name already exists")
+        
+        for k, v in fields.items():
+            if hasattr(proj, k):
+                setattr(proj, k, v)
+        
+        db.add(proj)
+        db.commit()
+        db.refresh(proj)
+        return proj
+
+
+def delete_project(project_id: int) -> None:
+    """Delete a project if it has no runs."""
+    with get_db() as db:
+        proj = db.get(Project, project_id)
+        if not proj:
+            return
+        
+        # Check if project has runs
+        run_count = db.query(Run).filter(Run.project_id == project_id).count()
+        if run_count > 0:
+            raise ValueError(f"Cannot delete project with {run_count} run(s). Please reassign or delete the runs first.")
+        
+        # Don't delete if it's the only project
+        total_projects = db.query(Project).count()
+        if total_projects <= 1:
+            raise ValueError("Cannot delete the last project. Create another project first.")
+        
+        db.delete(proj)
+        db.commit()
+
+
+def get_project_stats(project_id: int) -> Dict[str, Any]:
+    """Get statistics for a project."""
+    with get_db() as db:
+        runs = db.query(Run).filter(Run.project_id == project_id).all()
+        
+        total_images = sum(len(r.input_images_json or []) for r in runs)
+        total_cost_usd = sum(r.cost_usd or 0.0 for r in runs)
+        
+        # Count unique models used
+        models_used = set()
+        for r in runs:
+            if r.provider and r.provider.model_id:
+                models_used.add(r.provider.model_id)
+        
+        return {
+            "total_runs": len(runs),
+            "total_images": total_images,
+            "total_cost_usd": total_cost_usd,
+            "avg_cost_per_image": (total_cost_usd / total_images if total_images > 0 else 0.0),
+            "models_used": list(models_used),
+        }
+
+
+# ============================================================================
+# Provider Icons (LLM-generated SVG icons)
+# ============================================================================
+
+def get_provider_icon(provider_code: str) -> str | None:
+    """Retrieve cached SVG icon for a provider.
+    
+    Args:
+        provider_code: Provider identifier (e.g., 'openai', 'anthropic')
+    
+    Returns:
+        SVG content string or None if not found
+    """
+    with get_db() as db:
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        return icon.svg_content if icon else None
+
+
+def save_provider_icon(provider_code: str, svg_content: str) -> ProviderIcon:
+    """Store generated SVG icon for a provider.
+    
+    Args:
+        provider_code: Provider identifier
+        svg_content: Full SVG markup
+    
+    Returns:
+        Created or updated ProviderIcon instance
+    """
+    with get_db() as db:
+        # Check if already exists
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        
+        if icon:
+            # Update existing
+            icon.svg_content = svg_content
+        else:
+            # Create new
+            icon = ProviderIcon(provider_code=provider_code, svg_content=svg_content)
+            db.add(icon)
+        
+        db.commit()
+        db.refresh(icon)
+        return icon
+
+
+def delete_provider_icon(provider_code: str) -> bool:
+    """Delete cached icon for a provider (to trigger regeneration).
+    
+    Args:
+        provider_code: Provider identifier
+    
+    Returns:
+        True if deleted, False if not found
+    """
+    with get_db() as db:
+        icon = db.query(ProviderIcon).filter(ProviderIcon.provider_code == provider_code).first()
+        if icon:
+            db.delete(icon)
+            db.commit()
+            return True
+        return False
+
+
+def list_provider_icons() -> list[ProviderIcon]:
+    """List all cached provider icons.
+    
+    Returns:
+        List of ProviderIcon instances
+    """
+    with get_db() as db:
+        return db.query(ProviderIcon).order_by(ProviderIcon.created_at.desc()).all()

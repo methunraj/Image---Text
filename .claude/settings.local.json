@@ -6,7 +6,9 @@
       "Bash(python:*)",
       "Bash(streamlit run:*)",
       "WebFetch(domain:models.dev)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(tree:*)",
+      "WebFetch(domain:discuss.ai.google.dev)"
     ],
     "deny": [],
     "ask": []

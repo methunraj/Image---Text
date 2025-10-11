@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,20 +20,67 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.core import storage
+from app.core import template_assets
 from app.core.cost import cost_from_usage
+from app.core.currency import get_usd_to_inr, convert_usd_to_inr
 from app.core.json_enforcer import strip_code_fences
-from app.core.provider_openai import OAIGateway
+from app.core.model_registry import ModelRegistryError, ModelDescriptor, ensure_registry, active_model
+from app.core.provider_openai import gateway_from_descriptor
 from app.core.templating import RenderedMessages, render_user_prompt
 from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes, to_xlsx_bytes
+from app.core.checkpoints import FolderCheckpoint
 
 
 UPLOAD_DIR = Path("data/uploads")
 EXPORT_DIR = Path("export")
 
 
+@dataclass
+class ModelContext:
+    descriptor: ModelDescriptor
+    provider_record: storage.Provider
+    caps: Dict[str, Any]
+    pricing: Dict[str, Any]
+    reasoning: Dict[str, Any]
+
+
 def _ensure_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _build_model_context(descriptor: ModelDescriptor) -> ModelContext:
+    provider_record = storage.ensure_registry_provider(descriptor)
+    caps = descriptor.capabilities.model_dump()
+    pricing_cfg = descriptor.pricing
+    pricing: Dict[str, Any] = {
+        "pricing": {
+            "input_per_1k": pricing_cfg.input_per_1k,
+            "output_per_1k": pricing_cfg.output_per_1k,
+        }
+    }
+    if pricing_cfg.cache_read_per_1k is not None:
+        pricing["pricing"]["cache_read_per_1k"] = pricing_cfg.cache_read_per_1k
+    if pricing_cfg.cache_write_per_1k is not None:
+        pricing["pricing"]["cache_write_per_1k"] = pricing_cfg.cache_write_per_1k
+    pricing["pricing"]["input_per_million"] = pricing_cfg.input_per_million
+    pricing["pricing"]["output_per_million"] = pricing_cfg.output_per_million
+    pricing["pricing"]["cache_read_per_million"] = pricing_cfg.cache_read_per_million
+    pricing["pricing"]["cache_write_per_million"] = pricing_cfg.cache_write_per_million
+    reasoning_cfg = descriptor.reasoning
+    reasoning = {
+        "provider": reasoning_cfg.provider if reasoning_cfg else None,
+        "effort_default": reasoning_cfg.effort_default if reasoning_cfg else None,
+        "include_thoughts_default": reasoning_cfg.include_thoughts_default if reasoning_cfg else False,
+        "allow_override": reasoning_cfg.allow_override if reasoning_cfg else True,
+    }
+    return ModelContext(
+        descriptor=descriptor,
+        provider_record=provider_record,
+        caps=caps,
+        pricing=pricing,
+        reasoning=reasoning,
+    )
 
 
 def _sanitize_filename(name: str) -> str:
@@ -162,81 +210,34 @@ def _save_uploaded_files(files: List["UploadedFile"]) -> List[str]:
     return saved
 
 
+def _cleanup_uploaded_files() -> None:
+    """Remove all uploaded image files from data/uploads/ directory.
+    Preserves the uploads directory and pdf_tmp subdirectory structure.
+    """
+    try:
+        if UPLOAD_DIR.exists():
+            for item in UPLOAD_DIR.iterdir():
+                if item.is_file() and item.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                    try:
+                        item.unlink()
+                    except Exception:
+                        pass  # Skip files that can't be deleted
+    except Exception:
+        pass  # Fail silently if directory doesn't exist or can't be accessed
+
+
 def _image_capable() -> bool:
     """Check if active provider supports images."""
-    p = storage.get_active_provider()
-    if not p:
-        return True  # unknown; don't block
-    if isinstance(p.detected_caps_json, dict):
-        v = p.detected_caps_json.get("vision")
-        if isinstance(v, bool):
-            return v
-    mods = None
-    if isinstance(p.catalog_caps_json, dict):
-        mods = p.catalog_caps_json.get("modality") or p.catalog_caps_json.get("modalities")
-    if isinstance(mods, list):
-        return "image" in mods
-    return False
-
-
-def _get_active_provider_and_key() -> tuple[Optional[storage.Provider], Optional[str]]:
-    """Get active provider and corresponding API key (by provider_code)."""
-    p = storage.get_active_provider()
-    if not p:
-        return None, None
-    # Preferred path: provider-scoped key
-    api_key: Optional[str] = None
-    provider_code = (p.provider_code or "").strip().lower()
-    if provider_code:
-        # Check session-scoped key bucket by provider_code
-        sess_keys: Dict[str, str] = st.session_state.get("_provider_api_keys", {})
-        api_key = sess_keys.get(provider_code)
-        if not api_key:
-            # Fallback to persisted, encrypted key
-            api_key = storage.get_decrypted_api_key(provider_code)
-    else:
-        # Backwards compatibility: use legacy per-profile storage
-        if p.key_storage == "session":
-            keys: Dict[int, str] = st.session_state.get("_api_keys", {})
-            api_key = keys.get(p.id)
-        else:
-            try:
-                from cryptography.fernet import Fernet
-                kms_key = os.getenv("APP_KMS_KEY")
-                if not kms_key:
-                    try:
-                        kms_path = Path("data/kms.key")
-                        if kms_path.exists():
-                            kms_key = kms_path.read_text(encoding="utf-8").strip()
-                    except Exception:
-                        kms_key = None
-                if kms_key and p.api_key_enc:
-                    api_key = Fernet(kms_key).decrypt(p.api_key_enc.encode()).decode()
-            except Exception:
-                api_key = None
-    return p, api_key
-
-
-def _derive_request_plan(p: Optional[storage.Provider], schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Determine how to send request based on capabilities."""
-    plan = {"use_tools": False, "use_json_mode": False, "fallback": "prompt"}
-    if not p:
-        return plan
-    supports = p.detected_caps_json or {}
-    tools_ok = bool(supports.get("tools")) if isinstance(supports, dict) else False
-    json_ok = bool(supports.get("json_mode")) if isinstance(supports, dict) else False
-    if p.default_prefer_tools and tools_ok and bool(schema):
-        plan.update({"use_tools": True, "fallback": "json_mode" if (p.default_force_json_mode and json_ok) else "prompt"})
-        return plan
-    if p.default_force_json_mode and json_ok:
-        plan.update({"use_json_mode": True, "fallback": "prompt"})
-        return plan
-    return plan
+    try:
+        descriptor = active_model()
+    except ModelRegistryError:
+        return True
+    return bool(descriptor.capabilities.vision)
 
 
 def _process_images(
-    provider: storage.Provider,
-    api_key: str,
+    model_ctx: ModelContext,
+    gateway,
     template: storage.Template,
     image_paths: List[str],
     tags: Dict[str, Dict[str, str]],
@@ -273,63 +274,37 @@ def _process_images(
                     user_text = part.get("text", "")
                     break
     
-    # Create gateway with proper timeout
-    # Smart timeout defaults: longer for local models
-    url_lower = (provider.base_url or "").lower()
-    is_local_model = any(indicator in url_lower for indicator in [
-        "localhost", "127.0.0.1", "0.0.0.0", "192.168.",
-        "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
-        "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
-        "172.28.", "172.29.", "172.30.", "172.31.",  # Private IP range B
-        "host.docker.internal", ".local", ".lan", ":1234", ":5000", ":5001",
-        ":8000", ":8080", ":8888", ":9000", ":11434", ":7860", ":7861"
-    ])
-    
-    # Special check for 10.x.x.x range
-    if not is_local_model and "10." in url_lower:
-        import re
-        if re.search(r'(?:^|[^0-9])10\.\d{1,3}\.\d{1,3}\.\d{1,3}', url_lower):
-            is_local_model = True
-    
-    # Use 1 hour timeout to prevent premature timeouts
-    default_timeout = 3600
-    
-    gateway = OAIGateway(
-        base_url=provider.base_url,
-        api_key=api_key,
-        headers=provider.headers_json or {},
-        timeout=int(provider.timeout_s or default_timeout),
-        prefer_json_mode=False if unstructured else bool(provider.default_force_json_mode),
-        prefer_tools=False if unstructured else bool(provider.default_prefer_tools),
-        detected_caps=provider.detected_caps_json,
-        cached_max_tokens_param=provider.cached_max_tokens_param,
-        provider_id=provider.id
-    )
-    
+    descriptor = model_ctx.descriptor
+
     # Execute request with proper max_tokens
     start_time = time.time()
-    
-    # Ensure max_output_tokens is properly set (default to 4096 if not set)
-    max_tokens = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
-    
+
+    max_tokens_limit = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else None
+    if max_tokens_limit is None:
+        fallback_limit = 4096
+    else:
+        fallback_limit = max_tokens_limit
+
     # Show request configuration
     print(f"📤 Processing {len(image_paths)} image(s)")
-    print(f"   Model: {provider.model_id}")
-    print(f"   Max tokens: {max_tokens}")
-    print(f"   Timeout: {provider.timeout_s or 120}s")
-    
+    print(f"   Model: {descriptor.id}")
+    print(f"   Max tokens: {fallback_limit}")
+    print(f"   Timeout: {descriptor.timeouts.total_s}s")
+
+    gen_params: Dict[str, Any] = {"temperature": descriptor.default_temperature}
+    if descriptor.default_top_p is not None:
+        gen_params["top_p"] = descriptor.default_top_p
+    if max_tokens_limit is not None:
+        gen_params["max_tokens"] = max_tokens_limit
+
     result = gateway.chat_vision(
-        model=provider.model_id or "gpt-4o-mini",
+        model=descriptor.id,
         system_text=template.system_prompt or "",
         user_text=user_text,
         image_paths=image_paths,
         fewshot_messages=None,
         schema=None if unstructured else template.schema_json,
-        gen_params={
-            "temperature": float(provider.default_temperature if provider.default_temperature is not None else 1.0),
-            "top_p": float(provider.default_top_p or 1.0),
-            "max_tokens": max_tokens  # Use the properly set max_tokens
-        }
+        gen_params=gen_params,
     )
     elapsed = time.time() - start_time
     
@@ -392,7 +367,122 @@ def run() -> None:
     st.caption("Upload images and extract structured data using AI")
     
     storage.init_db()
+    template_assets.sync_from_assets()
     _ensure_dirs()
+    
+    # Clean up uploaded files from previous sessions
+    _cleanup_uploaded_files()
+    
+    # Sidebar: Project stats and cost tracking
+    with st.sidebar:
+        st.markdown("#### 📁 Active Project")
+        
+        try:
+            projects = storage.list_projects()
+            if not projects:
+                # Initialize with default project if none exist
+                storage.init_db()
+                projects = storage.list_projects()
+            
+            if projects:
+                active_project = storage.get_active_project()
+                project_names = [p.name for p in projects]
+                
+                # If no active project, set the first one as active
+                if not active_project and projects:
+                    storage.set_active_project(projects[0].id)
+                    active_project = projects[0]
+                
+                current_index = 0
+                if active_project and active_project.name in project_names:
+                    current_index = project_names.index(active_project.name)
+                
+                selected = st.selectbox(
+                    "Select Project",
+                    options=project_names,
+                    index=current_index,
+                    key="upload_page_project_selector",
+                    label_visibility="collapsed"
+                )
+                
+                # Switch project if selection changed
+                if active_project and selected != active_project.name:
+                    new_proj = next((p for p in projects if p.name == selected), None)
+                    if new_proj:
+                        storage.set_active_project(new_proj.id)
+                        st.rerun()
+                
+                # Show project stats
+                if active_project:
+                    stats = storage.get_project_stats(active_project.id)
+                    
+                    # Get currency rate for INR display
+                    usd_to_inr = get_usd_to_inr()
+                    
+                    # Show currency rate badge
+                    if usd_to_inr:
+                        st.markdown(
+                            f'<div style="background-color: #d1fae5; color: #065f46; padding: 6px 10px; '
+                            f'border-radius: 6px; font-size: 0.8rem; margin: 12px 0; text-align: center; '
+                            f'font-weight: 500; border: 1px solid #a7f3d0;">'
+                            f'💱 1 USD = ₹{usd_to_inr:.2f}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Stats in clean columns
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">IMAGES</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_images"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    with col2:
+                        st.markdown(
+                            f'<div style="text-align: center; padding: 8px; background-color: #f9fafb; '
+                            f'border-radius: 6px; margin-bottom: 8px;">'
+                            f'<div style="font-size: 0.7rem; color: #6b7280; font-weight: 500;">RUNS</div>'
+                            f'<div style="font-size: 1.5rem; font-weight: 600; color: #111827; margin-top: 2px;">{stats["total_runs"]}</div>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Total cost section
+                    total_usd = stats['total_cost_usd']
+                    cost_html = '<div style="padding: 10px; background-color: #fef3c7; border-radius: 6px; border: 1px solid #fde68a; margin-top: 8px;">'
+                    cost_html += '<div style="font-size: 0.7rem; color: #92400e; font-weight: 500; margin-bottom: 4px;">TOTAL SPENT</div>'
+                    cost_html += f'<div style="font-size: 1.1rem; font-weight: 600; color: #78350f;">${total_usd:.4f}</div>'
+                    
+                    if usd_to_inr:
+                        total_inr = convert_usd_to_inr(total_usd, rate=usd_to_inr)
+                        if total_inr is not None:
+                            cost_html += f'<div style="font-size: 0.85rem; color: #92400e; margin-top: 2px;">₹{total_inr:.2f}</div>'
+                    
+                    cost_html += '</div>'
+                    st.markdown(cost_html, unsafe_allow_html=True)
+                    
+                    # Average per image - only show if there are images
+                    if stats['total_images'] > 0:
+                        avg_usd = total_usd / stats['total_images']
+                        avg_text = f"${avg_usd:.4f}"
+                        if usd_to_inr:
+                            avg_inr = convert_usd_to_inr(avg_usd, rate=usd_to_inr)
+                            if avg_inr is not None:
+                                avg_text += f" • ₹{avg_inr:.4f}"
+                        st.markdown(
+                            f'<div style="text-align: center; font-size: 0.75rem; color: #6b7280; margin-top: 8px;">'
+                            f'Avg per image: {avg_text}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+        except Exception as e:
+            st.error(f"Error loading projects: {e}")
+        
+        st.markdown("---")
     
     # Check capabilities
     if not _image_capable():
@@ -409,6 +499,9 @@ def run() -> None:
         horizontal=True,
         help="Upload individual images or add an entire folder"
     )
+    
+    # Info about PDF conversion
+    st.info("💡 Need to convert PDFs to images? Use **Settings → PDF Tools** to convert PDF pages to images first.")
 
     if src_choice == "Upload files":
         uploaded = st.file_uploader(
@@ -421,12 +514,15 @@ def run() -> None:
         if uploaded:
             saved_paths = _save_uploaded_files(uploaded)
             lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+            selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
             for pth in saved_paths:
                 if pth not in lst:
                     lst.append(pth)
+                if pth not in selected_lst:
+                    selected_lst.append(pth)
             if saved_paths:
                 st.success(f"✅ Uploaded {len(saved_paths)} file(s)")
-    else:
+    elif src_choice == "Select folder":
         col_f1, col_f2 = st.columns([3, 1])
         with col_f1:
             default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
@@ -450,27 +546,95 @@ def run() -> None:
             add_all = st.button("Add Folder")
         with col_b2:
             preview = st.button("Preview")
-        if preview and folder_ok:
-            imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
+
+        # Compute images and checkpoint info when folder is OK
+        imgs_found: List[str] = []
+        cp: FolderCheckpoint | None = None
+        if folder_ok:
+            folder_abs = Path(_normalize_folder_input(folder_path)).resolve()
+            imgs_found = _find_images_in_folder(folder_abs, recursive)
+            # Load or initialize checkpoint
+            cp = FolderCheckpoint(folder_abs)
+            cp.load()
             if imgs_found:
-                st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
+                cp.ensure_entries(imgs_found)
+                cp.prune_missing()
+                try:
+                    cp.save()
+                except Exception:
+                    pass
+
+        if preview and folder_ok:
+            if imgs_found:
+                if cp:
+                    stats = cp.get_stats_for(imgs_found)
+                    st.info(f"Found {stats['total']} image(s) • {stats['processed']} processed • {stats['failed']} failed • {stats['pending']} pending")
+                else:
+                    st.info(f"Found {len(imgs_found)} image(s). Click 'Add Folder' to add them.")
             else:
                 st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
+
+        # Resume/Retry/Reset controls when a checkpoint is available
+        if folder_ok and imgs_found and cp is not None:
+            st.markdown("#### Checkpoint")
+            r1, r2, r3 = st.columns([1.2, 1.2, 1])
+            with r1:
+                resume = st.button("Resume pending", key="resume_pending")
+            with r2:
+                retry_failed = st.button("Retry failed only", key="retry_failed")
+            with r3:
+                reset_cp = st.button("Reset checkpoint", key="reset_checkpoint")
+
+            if reset_cp:
+                cp.reset()
+                cp.save()
+                st.success("Checkpoint reset: all files marked pending")
+
+            if resume:
+                pending = cp.pending_files(imgs_found)
+                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                added = 0
+                for p in pending:
+                    if p not in lst:
+                        lst.append(p)
+                        added += 1
+                    if p not in selected_lst:
+                        selected_lst.append(p)
+                st.session_state["last_folder_path"] = folder_path
+                st.success(f"✅ Added {added} pending image(s)")
+
+            if retry_failed:
+                failed = cp.failed_files(imgs_found)
+                lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
+                added = 0
+                for p in failed:
+                    if p not in lst:
+                        lst.append(p)
+                        added += 1
+                    if p not in selected_lst:
+                        selected_lst.append(p)
+                st.session_state["last_folder_path"] = folder_path
+                st.success(f"✅ Added {added} failed image(s)")
+
         if add_all:
             if not folder_ok:
                 st.error("Folder does not exist or is not accessible.")
             else:
                 st.session_state["last_folder_path"] = folder_path
-                imgs_found = _find_images_in_folder(Path(_normalize_folder_input(folder_path)), recursive)
                 if not imgs_found:
                     st.warning("No images found in this folder. Supported types: PNG, JPG, JPEG, WEBP, BMP, GIF, TIF, TIFF, HEIC, HEIF, JFIF.")
                 else:
                     lst: List[str] = st.session_state.setdefault("uploaded_images", [])
+                    selected_lst: List[str] = st.session_state.setdefault("selected_images", [])
                     added = 0
                     for p in imgs_found:
                         if p not in lst:
                             lst.append(p)
                             added += 1
+                        if p not in selected_lst:
+                            selected_lst.append(p)
                     st.success(f"✅ Added {added} image(s) from folder")
     
     # Image Management (Simple List)
@@ -480,12 +644,12 @@ def run() -> None:
         st.info("No images uploaded yet. Upload some images to get started.")
         return
     
-    st.markdown(f"### Input Files ({len(imgs)})")
-    
-    # Simple list view without previews
+    # Original simple list (no wrapper), keep compact controls
     selected: List[str] = st.session_state.setdefault("selected_images", [])
     tags: Dict[str, Dict[str, str]] = st.session_state.setdefault("image_tags", {})
-    
+
+    st.markdown(f"### Input Files ({len(imgs)})")
+
     # Select all/none buttons
     col1, col2, col3 = st.columns([1, 1, 4])
     with col1:
@@ -500,15 +664,19 @@ def run() -> None:
             st.rerun()
     with col3:
         st.write(f"Selected: {len(selected)} of {len(imgs)}")
-    
-    # File list
+
     with st.container(border=True):
         for idx, pth in enumerate(imgs):
             col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
             
             with col1:
                 stable_key = f"sel_{hashlib.sha1(pth.encode('utf-8')).hexdigest()[:10]}"
-                checked = st.checkbox("", value=(pth in selected), key=stable_key)
+                checked = st.checkbox(
+                    "Select",
+                    value=(pth in selected),
+                    key=stable_key,
+                    label_visibility="collapsed",
+                )
                 if checked and pth not in selected:
                     selected.append(pth)
                 elif not checked and pth in selected:
@@ -526,19 +694,19 @@ def run() -> None:
                     st.text("-")
             
             with col4:
-                # Optional tags (collapsible)
+                # Optional tags (collapsible per file)
                 with st.expander("Tags"):
                     t = tags.get(pth, {"doc_type": "", "locale": "en-US"})
                     t["doc_type"] = st.text_input(
-                        "Type", 
-                        value=t.get("doc_type", ""), 
+                        "Type",
+                        value=t.get("doc_type", ""),
                         key=f"doc_{idx}",
-                        placeholder="receipt, invoice, etc."
+                        placeholder="receipt, invoice, etc.",
                     )
                     t["locale"] = st.text_input(
-                        "Locale", 
-                        value=t.get("locale", "en-US"), 
-                        key=f"loc_{idx}"
+                        "Locale",
+                        value=t.get("locale", "en-US"),
+                        key=f"loc_{idx}",
                     )
                     tags[pth] = t
     
@@ -550,44 +718,126 @@ def run() -> None:
         return
     
     st.divider()
-    
+
     # Process Section
     st.markdown("## 2️⃣ Process Images")
-    
-    # Get provider and template
-    provider, api_key = _get_active_provider_and_key()
-    if not provider:
-        st.error("❌ No active provider configured")
-        if st.button("Configure Provider"):
-            st.switch_page("pages/2_Settings.py")
+
+    try:
+        registry = ensure_registry()
+    except ModelRegistryError as exc:
+        st.error(f"❌ Model registry error: {exc}")
         return
-    
-    # Allow local endpoints without API key (e.g., LM Studio)
-    is_local = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
-    if not api_key and not is_local:
-        st.error("❌ No API key configured for active provider")
-        if st.button("Add API Key"):
-            st.switch_page("pages/2_Settings.py")
+
+    selectable_models = [
+        descriptor
+        for descriptor in registry.models.values()
+        if descriptor.show_in_ui
+    ]
+
+    selected_model_id = st.session_state.get("_selected_model_id")
+    try:
+        current_descriptor = registry.resolve(selected_model_id)
+    except ModelRegistryError:
+        current_descriptor = registry.resolve(None)
+        st.session_state["_selected_model_id"] = current_descriptor.id
+    else:
+        st.session_state["_selected_model_id"] = current_descriptor.id
+
+    if registry.policies.allow_frontend_model_selection and len(selectable_models) > 1:
+        options = sorted(
+            selectable_models,
+            key=lambda m: (m.provider_label.lower(), m.label.lower()),
+        )
+        default_index = next(
+            (idx for idx, mdl in enumerate(options) if mdl.id == current_descriptor.id),
+            0,
+        )
+        choice = st.selectbox(
+            "Select Model",
+            options=options,
+            index=default_index,
+            format_func=lambda mdl: f"{mdl.provider_label} • {mdl.label}",
+            help="Choose which configured model to use for this run.",
+            key="model_selection",
+        )
+        if choice.id != current_descriptor.id:
+            current_descriptor = choice
+            st.session_state["_selected_model_id"] = choice.id
+    else:
+        st.caption(f"Using model: {current_descriptor.provider_label} • {current_descriptor.label}")
+
+    # Load model context from registry
+    try:
+        model_ctx = _build_model_context(current_descriptor)
+    except Exception as exc:
+        st.error(f"❌ Failed to load model configuration: {exc}")
         return
-    
-    # Template selection
-    templates = storage.list_templates()
-    if not templates:
-        st.warning("⚠️ No templates configured")
-        if st.button("Create Template"):
-            st.switch_page("pages/2_Settings.py")
-        return
-    
-    template_names = [t.name for t in templates]
-    selected_template_name = st.selectbox(
-        "Select Template",
-        options=template_names,
-        help="Choose a template to extract data from images"
+
+    descriptor = model_ctx.descriptor
+
+    # Output format selection (replaces single 'Unstructured' toggle)
+    st.markdown("#### Output Format")
+    output_mode = st.radio(
+        "Choose output format",
+        options=["Structured (Template)", "Structured (Auto JSON)", "Unstructured (Markdown)"],
+        help="Use a saved template (schema + prompts), or let the model infer JSON without a schema, or get raw Markdown.",
+        horizontal=True,
+        key="output_mode_radio",
     )
+    auto_json = output_mode == "Structured (Auto JSON)"
+    unstructured = output_mode == "Unstructured (Markdown)"
+
+    # Template selection
+    selected_template = None
+    selected_template_name = None
+    if not auto_json and not unstructured:
+        templates = storage.list_templates()
+        if not templates:
+            st.warning("⚠️ No templates configured")
+            if st.button("Create Template"):
+                st.switch_page("pages/2_Settings.py")
+            return
+        
+        template_names = [t.name for t in templates]
+        selected_template_name = st.selectbox(
+            "Select Template",
+            options=template_names,
+            help="Choose a template to extract data from images"
+        )
+        
+        selected_template = next((t for t in templates if t.name == selected_template_name), None)
+
+    # Synthetic template for Auto JSON / Unstructured
+    if auto_json:
+        from types import SimpleNamespace
+        selected_template_name = "Auto JSON"
+        selected_template = SimpleNamespace(
+            id=None,
+            name=selected_template_name,
+            system_prompt=(
+                "You are a precise JSON generator. Analyze the image and output ONLY valid JSON. "
+                "Capture fields present in the document with reasonable keys. Use numbers for numeric values, "
+                "use arrays where multiple items are present, and nest objects as needed. Do not include code fences or explanations."
+            ),
+            user_prompt=(
+                "Extract information from the image. Document type: {doc_type}. Locale: {locale}.\n"
+                "Today's date is {today}. Respond with a single JSON object (or array if multiple entries). "
+                "Return JSON ONLY."
+            ),
+            schema_json=None,
+        )
+    elif unstructured and selected_template is None:
+        from types import SimpleNamespace
+        selected_template_name = "Unstructured"
+        selected_template = SimpleNamespace(
+            id=None,
+            name=selected_template_name,
+            system_prompt="",
+            user_prompt="",
+            schema_json=None,
+        )
     
-    selected_template = next((t for t in templates if t.name == selected_template_name), None)
-    
-    if selected_template:
+    if selected_template and not auto_json and not unstructured:
         # Show template info
         with st.expander("Template Details"):
             st.write(f"**Description:** {selected_template.description or 'No description'}")
@@ -596,24 +846,77 @@ def run() -> None:
     
     # Show current settings
     with st.expander("Current Settings", expanded=False):
-        st.write(f"**Model:** {provider.model_id}")
-        st.write(f"**Max Output Tokens:** {provider.default_max_output_tokens or 4096}")
-        st.write(f"**Temperature:** {provider.default_temperature if provider.default_temperature is not None else 1.0}")
-        st.write(f"**API Endpoint:** {provider.base_url}")
+        st.write(f"**Provider:** {descriptor.provider_label}")
+        st.write(f"**Model:** {descriptor.label}")
+        max_tokens_display = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else "Unlimited"
+        st.write(f"**Max Output Tokens:** {max_tokens_display}")
+        st.write(f"**Temperature:** {descriptor.default_temperature}")
+        st.write(f"**Endpoint:** {descriptor.base_url}")
+        per_million_in = model_ctx.pricing["pricing"].get("input_per_million")
+        per_million_out = model_ctx.pricing["pricing"].get("output_per_million")
+        if per_million_in is not None or per_million_out is not None:
+            in_display = f"${per_million_in:.4f}" if per_million_in is not None else "—"
+            out_display = f"${per_million_out:.4f}" if per_million_out is not None else "—"
+            st.write(f"**Price (input/output per 1M):** {in_display} / {out_display}")
+        # Show INR per 1M if exchange rate available
+        try:
+            rate = get_usd_to_inr()
+            if rate and (per_million_in is not None or per_million_out is not None):
+                in_inr = f"₹{(per_million_in * rate):.2f}" if per_million_in is not None else "—"
+                out_inr = f"₹{(per_million_out * rate):.2f}" if per_million_out is not None else "—"
+                st.write(f"**Price (INR per 1M):** {in_inr} / {out_inr}  ")
+        except Exception:
+            pass
+        reasoning_provider = model_ctx.reasoning.get("provider")
+        if reasoning_provider:
+            reason_parts = [reasoning_provider]
+            effort = model_ctx.reasoning.get("effort_default")
+            if effort:
+                reason_parts.append(str(effort))
+            st.write(f"**Reasoning defaults:** {', '.join(reason_parts)}")
     
     # Output mode toggle and Process button
     col1, col2, col3, col4 = st.columns([1.2, 1.4, 3.4, 1])
     with col1:
-        # Minimal, per-run toggle to avoid DB/schema changes
-        unstructured = st.checkbox("Unstructured", help="Skip schema; return plain text/Markdown.")
+        # Reflect selected output format (disabled, driven by radio above)
+        st.checkbox("Unstructured", value=unstructured, help="Skip schema; return plain text/Markdown.", disabled=True)
     with col2:
-        per_file_mode = st.checkbox("Per-file save", help="Process each file separately and auto-save next to inputs")
+        per_file_mode = st.checkbox(
+            "Per-file save",
+            value=st.session_state.get('per_file_mode_default', False),
+            key='per_file_mode_checkbox',
+            help="Process each file separately and auto-save next to inputs",
+        )
+
+    # Format selection when per-file save is enabled
+    save_formats = {'json': True, 'md': True, 'docx': True}  # Default: all formats
+    if per_file_mode:
+        st.markdown("**Select formats to save:**")
+        fcol1, fcol2, fcol3, _ = st.columns([1, 1, 1, 3])
+        with fcol1:
+            save_formats['json'] = st.checkbox("JSON", value=True, key='save_json')
+        with fcol2:
+            save_formats['md'] = st.checkbox("Markdown", value=True, key='save_md')
+        with fcol3:
+            save_formats['docx'] = st.checkbox("Word", value=True, key='save_docx')
+
+        # Ensure at least one format is selected
+        if not any(save_formats.values()):
+            st.warning("⚠️ Please select at least one format to save")
+    # Allow auto-processing (e.g., after PDF conversion)
+    auto_process_flag = bool(st.session_state.get('_auto_process_request', False))
+    if auto_process_flag:
+        st.session_state['per_file_mode_default'] = True
+        per_file_mode = True
     with col3:
         process_clicked = st.button(
             f"▶️ Process {len(selected)} Image(s)",
             type="primary",
-            use_container_width=True
+            use_container_width=True,
         )
+    process_clicked = bool(process_clicked or auto_process_flag)
+    if auto_process_flag:
+        st.session_state.pop('_auto_process_request', None)
     with col4:
         # Clear results button
         if 'last_result' in st.session_state:
@@ -643,8 +946,19 @@ def run() -> None:
             # Show info about cached results
             st.info(f"📋 Showing cached results from {int(time_ago/60)} minute(s) ago. Click 'Process' to refresh.")
     
+    # Handle automatic refresh after processing to update sidebar
+    show_processing_results = False
+    if st.session_state.get('_just_processed_refresh', False):
+        st.session_state['_just_processed_refresh'] = False
+        show_processing_results = True  # Show results even without button click
+    
     # Per-file mode: run one-by-one and save
-    if process_clicked and selected_template and per_file_mode:
+    if process_clicked and selected_template and per_file_mode and not show_processing_results:
+        # Check if at least one format is selected
+        if not any(save_formats.values()):
+            st.error("⚠️ Please select at least one format to save before processing")
+            return
+
         st.markdown("### Processing & Saving Per File")
         from scripts.export_records import to_docx_bytes, to_docx_from_text_bytes
         total = len(selected)
@@ -652,54 +966,440 @@ def run() -> None:
         saved_counts = {"json": 0, "md": 0, "docx": 0}
         errors: List[str] = []
         st.session_state['per_file_mode_active'] = True
+        # Prepare checkpoint (works for both folder-based and uploaded files)
+        checkpoint: FolderCheckpoint | None = None
+        base_folder_raw = st.session_state.get("last_folder_path")
+        
+        try:
+            if base_folder_raw:
+                # Folder-based processing
+                base_folder = Path(_normalize_folder_input(base_folder_raw)).resolve()
+            else:
+                # Uploaded files - use upload directory
+                base_folder = UPLOAD_DIR.resolve()
+            
+            checkpoint = FolderCheckpoint(base_folder)
+            checkpoint.load()
+            # record run context
+            try:
+                checkpoint.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                # Set project context
+                active_project = storage.get_active_project()
+                if active_project:
+                    checkpoint.set_project_context(active_project.id, active_project.name)
+                checkpoint.save()
+            except Exception:
+                pass
+        except Exception:
+            checkpoint = None
+
+        # Detect processing mode: folder-based or uploaded files
+        is_folder_mode = bool(base_folder_raw)
+        
+        # For folder mode, create output directory
+        output_dir = None
+        if is_folder_mode:
+            try:
+                source_folder = Path(_normalize_folder_input(base_folder_raw)).resolve()
+                output_dir = source_folder / "output"
+                output_dir.mkdir(exist_ok=True)
+                st.caption(f"📁 Output directory: {output_dir}")
+            except Exception as e:
+                st.error(f"Failed to create output directory: {e}")
+                return
+        
+        # Store download data for uploaded files
+        download_data = []  # List of (filename, format, bytes)
+        db_records_created = 0  # Track successful database recordings
+        
         for idx, img_path in enumerate(selected, start=1):
             try:
+                per_file_gateway = gateway_from_descriptor(descriptor)
+                if unstructured:
+                    per_file_gateway.prefer_json_mode = False
+                    per_file_gateway.prefer_tools = False
                 result = _process_images(
-                    provider,
-                    api_key or "",
+                    model_ctx,
+                    per_file_gateway,
                     selected_template,
                     [img_path],
                     tags,
                     unstructured=unstructured,
                 )
                 out = result.get("output")
+                usage = result.get("usage")
                 in_path = Path(img_path)
-                out_dir = in_path.parent
                 base_name = _guess_original_stem(in_path)
+                
+                # Update checkpoint stats with tokens and cost
+                if checkpoint is not None and usage:
+                    tokens_in = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+                    tokens_out = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+                    cost_info = cost_from_usage(usage, model_ctx.pricing)
+                    cost_usd = cost_info.get("total_usd", 0.0) if cost_info else 0.0
+                    checkpoint.update_processing_stats(tokens_in, tokens_out, cost_usd)
+                
                 if not out:
                     errors.append(f"No output for {in_path.name}")
+                    if checkpoint is not None:
+                        checkpoint.mark_failed(img_path, "No output")
                 else:
+                    saved_files = {}
+                    
                     if unstructured and isinstance(out, dict) and 'raw_text' in out:
                         text = str(out.get('raw_text') or "")
-                        (out_dir / f"{base_name}.md").write_bytes((text or "").encode("utf-8"))
-                        docx_bytes = to_docx_from_text_bytes(text, title=base_name)
-                        (out_dir / f"{base_name}.docx").write_bytes(docx_bytes)
-                        recs = ensure_records({"raw_text": text})
-                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
-                        saved_counts['md'] += 1
-                        saved_counts['docx'] += 1
-                        saved_counts['json'] += 1
+                        
+                        # Process formats based on mode
+                        if is_folder_mode:
+                            # FOLDER MODE: Save to output/ directory
+                            if save_formats.get('md', False):
+                                md_bytes = (text or "").encode("utf-8")
+                                (output_dir / f"{base_name}.md").write_bytes(md_bytes)
+                                saved_files['md'] = str(output_dir / f"{base_name}.md")
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                                (output_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                                saved_files['docx'] = str(output_dir / f"{base_name}.docx")
+                                saved_counts['docx'] += 1
+                            if save_formats.get('json', False):
+                                recs = ensure_records({"raw_text": text})
+                                json_bytes = to_json_bytes(recs)
+                                (output_dir / f"{base_name}.json").write_bytes(json_bytes)
+                                saved_files['json'] = str(output_dir / f"{base_name}.json")
+                                saved_counts['json'] += 1
+                        else:
+                            # UPLOAD MODE: Prepare for download
+                            if save_formats.get('md', False):
+                                md_bytes = (text or "").encode("utf-8")
+                                download_data.append((base_name, 'md', md_bytes))
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_from_text_bytes(text, title=base_name)
+                                download_data.append((base_name, 'docx', docx_bytes))
+                                saved_counts['docx'] += 1
+                            if save_formats.get('json', False):
+                                recs = ensure_records({"raw_text": text})
+                                json_bytes = to_json_bytes(recs)
+                                download_data.append((base_name, 'json', json_bytes))
+                                saved_counts['json'] += 1
+                        
+                        if checkpoint is not None:
+                            checkpoint.mark_processed(img_path, saved_files)
+                        
+                        # Record run in database for project stats
+                        try:
+                            cost_to_record = cost_usd if 'cost_usd' in locals() and cost_usd else None
+                            storage.record_run(
+                                provider_id=model_ctx.provider_record.id,
+                                template_id=(getattr(selected_template, 'id', None) or None),
+                                input_images=[img_path],
+                                output={"raw_text": text},
+                                cost_usd=cost_to_record,
+                                status="completed"
+                            )
+                            db_records_created += 1
+                        except Exception as e:
+                            # Silent but log to errors for debugging
+                            errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
                     else:
                         recs = ensure_records(out)
                         cols = all_columns(recs)
-                        (out_dir / f"{base_name}.json").write_bytes(to_json_bytes(recs))
-                        (out_dir / f"{base_name}.md").write_bytes(to_markdown_bytes(recs, cols))
-                        (out_dir / f"{base_name}.docx").write_bytes(to_docx_bytes(recs, cols))
-                        saved_counts['json'] += 1
-                        saved_counts['md'] += 1
-                        saved_counts['docx'] += 1
+                        
+                        # Process formats based on mode
+                        if is_folder_mode:
+                            # FOLDER MODE: Save to output/ directory
+                            if save_formats.get('json', False):
+                                json_bytes = to_json_bytes(recs)
+                                (output_dir / f"{base_name}.json").write_bytes(json_bytes)
+                                saved_files['json'] = str(output_dir / f"{base_name}.json")
+                                saved_counts['json'] += 1
+                            if save_formats.get('md', False):
+                                md_bytes = to_markdown_bytes(recs, cols)
+                                (output_dir / f"{base_name}.md").write_bytes(md_bytes)
+                                saved_files['md'] = str(output_dir / f"{base_name}.md")
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_bytes(recs, cols)
+                                (output_dir / f"{base_name}.docx").write_bytes(docx_bytes)
+                                saved_files['docx'] = str(output_dir / f"{base_name}.docx")
+                                saved_counts['docx'] += 1
+                        else:
+                            # UPLOAD MODE: Prepare for download
+                            if save_formats.get('json', False):
+                                json_bytes = to_json_bytes(recs)
+                                download_data.append((base_name, 'json', json_bytes))
+                                saved_counts['json'] += 1
+                            if save_formats.get('md', False):
+                                md_bytes = to_markdown_bytes(recs, cols)
+                                download_data.append((base_name, 'md', md_bytes))
+                                saved_counts['md'] += 1
+                            if save_formats.get('docx', False):
+                                docx_bytes = to_docx_bytes(recs, cols)
+                                download_data.append((base_name, 'docx', docx_bytes))
+                                saved_counts['docx'] += 1
+                        
+                        if checkpoint is not None:
+                            checkpoint.mark_processed(img_path, saved_files)
+                        
+                        # Record run in database for project stats
+                        try:
+                            cost_to_record = cost_usd if 'cost_usd' in locals() and cost_usd else None
+                            storage.record_run(
+                                provider_id=model_ctx.provider_record.id,
+                                template_id=(getattr(selected_template, 'id', None) or None),
+                                input_images=[img_path],
+                                output=out,
+                                cost_usd=cost_to_record,
+                                status="completed"
+                            )
+                            db_records_created += 1
+                        except Exception as e:
+                            # Silent but log to errors for debugging
+                            errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
             except Exception as e:
                 errors.append(f"Save failed for {Path(img_path).name}: {e}")
+                if checkpoint is not None:
+                    checkpoint.mark_failed(img_path, str(e))
             finally:
                 progress.progress(idx/total, text=f"Processing {idx}/{total}")
+                if checkpoint is not None:
+                    try:
+                        checkpoint.save()
+                    except Exception:
+                        pass
         progress.empty()
-        st.success(f"Saved: {saved_counts['json']} JSON, {saved_counts['md']} MD, {saved_counts['docx']} DOCX next to inputs")
+
+        # Build success message and download buttons based on mode
+        saved_msgs = []
+        if save_formats.get('json', False):
+            saved_msgs.append(f"{saved_counts['json']} JSON")
+        if save_formats.get('md', False):
+            saved_msgs.append(f"{saved_counts['md']} Markdown")
+        if save_formats.get('docx', False):
+            saved_msgs.append(f"{saved_counts['docx']} Word")
+
+        if is_folder_mode:
+            # FOLDER MODE: Show save location
+            if saved_msgs:
+                st.success(f"✅ Saved: {', '.join(saved_msgs)} files to `{output_dir}` directory")
+            else:
+                st.warning("⚠️ No files saved (no formats selected)")
+        else:
+            # UPLOAD MODE: Show download buttons
+            if download_data:
+                st.success(f"✅ Processed {len(selected)} files. Download buttons below:")
+                st.markdown("### 📥 Download Processed Files")
+                
+                # Group downloads by filename
+                files_by_name = {}
+                for base_name, fmt, data in download_data:
+                    if base_name not in files_by_name:
+                        files_by_name[base_name] = []
+                    files_by_name[base_name].append((fmt, data))
+                
+                # Create download buttons for each file
+                for base_name, formats in files_by_name.items():
+                    st.markdown(f"**{base_name}**")
+                    cols = st.columns(len(formats))
+                    for idx, (fmt, data) in enumerate(formats):
+                        with cols[idx]:
+                            # Map format to extension and MIME type
+                            ext_map = {'json': ('.json', 'application/json'),
+                                     'md': ('.md', 'text/markdown'),
+                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext, mime = ext_map[fmt]
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            st.download_button(
+                                label_map[fmt],
+                                data=data,
+                                file_name=f"{base_name}{ext}",
+                                mime=mime,
+                                key=f"download_{base_name}_{fmt}",
+                                use_container_width=True
+                            )
+                    st.divider()
+            else:
+                st.warning("⚠️ No files processed")
+        
         if errors:
             with st.expander("Errors encountered"):
                 for e in errors:
                     st.error(e)
+        
+        # Show checkpoint and database information
+        st.success(f"✅ **Processing complete:** {len(selected) - len(errors)}/{len(selected)} files successful")
+        
+        if db_records_created > 0:
+            st.info(f"📊 **Database updated:** {db_records_created} runs recorded for project stats")
+        else:
+            st.warning("⚠️ **Database not updated:** No runs were recorded. Check errors below.")
+        
+        if checkpoint is not None:
+            checkpoint_stats = checkpoint.get_processing_stats()
+            st.info(
+                f"📋 **Checkpoint saved:** ${checkpoint_stats.get('total_cost_usd', 0.0):.4f} total cost"
+            )
+            if is_folder_mode:
+                checkpoint_path = Path(_normalize_folder_input(base_folder_raw)).resolve() / ".img2json.checkpoint.json"
+                st.caption(f"📁 Checkpoint location: `{checkpoint_path}`")
+        
+        # Cleanup uploaded files after successful processing in upload mode
+        if not is_folder_mode:
+            # Store list of uploaded files to clean
+            uploaded_files_to_clean = [img for img in selected if str(UPLOAD_DIR.resolve()) in img]
+            if uploaded_files_to_clean:
+                try:
+                    for img_path in uploaded_files_to_clean:
+                        Path(img_path).unlink(missing_ok=True)
+                    st.caption(f"🗑️ Cleaned up {len(uploaded_files_to_clean)} uploaded file(s)")
+                except Exception:
+                    pass  # Silent failure
+            
+            # Clear session state after cleanup
+            if 'uploaded_images' in st.session_state:
+                # Remove only the files that were processed
+                remaining = [img for img in st.session_state['uploaded_images'] 
+                            if img not in uploaded_files_to_clean]
+                st.session_state['uploaded_images'] = remaining
+                st.session_state['selected_images'] = []
+        
+        # Generate project report
+        active_project = storage.get_active_project()
+        if active_project and checkpoint:
+            st.markdown("### 📊 Project Report")
+            with st.spinner("Generating project report..."):
+                try:
+                    from app.core.report_generator import save_project_report
+                    export_dir = Path("export")
+                    # Use source folder for folder mode, None for upload mode
+                    checkpoint_dir = Path(_normalize_folder_input(base_folder_raw)).resolve() if base_folder_raw else None
+                    report_path = save_project_report(active_project.id, export_dir, checkpoint_dir=checkpoint_dir)
+                    
+                    st.success(f"✅ Project report generated: `{report_path}`")
+                    
+                    # Offer download
+                    report_content = report_path.read_text(encoding="utf-8")
+                    st.download_button(
+                        "📥 Download Report",
+                        data=report_content,
+                        file_name=report_path.name,
+                        mime="text/markdown",
+                        key="download_project_report"
+                    )
+                except Exception as e:
+                    st.warning(f"Could not generate report: {e}")
+        
+        # Store results in session state for display after refresh
+        st.session_state['_last_processing_results'] = {
+            'saved_msgs': saved_msgs,
+            'download_data': download_data,
+            'is_folder_mode': is_folder_mode,
+            'output_dir': str(output_dir) if output_dir else None,
+            'errors': errors,
+            'db_records_created': db_records_created,
+            'checkpoint_stats': checkpoint.get_processing_stats() if checkpoint else None,
+            'checkpoint_path': str(Path(_normalize_folder_input(base_folder_raw)).resolve() / ".img2json.checkpoint.json") if is_folder_mode and base_folder_raw else None,
+            'selected_count': len(selected),
+            'uploaded_files_to_clean': [img for img in selected if str(UPLOAD_DIR.resolve()) in img] if not is_folder_mode else []
+        }
+        
         # End per-file mode early to avoid aggregated rendering
         st.session_state['per_file_mode_active'] = False
+        
+        # Trigger automatic page refresh to update sidebar stats
+        st.session_state['_just_processed_refresh'] = True
+        st.rerun()
+        
+        return
+    
+    # Display stored results after refresh
+    if show_processing_results and '_last_processing_results' in st.session_state:
+        results = st.session_state['_last_processing_results']
+        
+        st.markdown("### Processing & Saving Per File")
+        st.markdown("---")
+        
+        # Build success message and download buttons based on mode
+        if results['is_folder_mode']:
+            # FOLDER MODE: Show save location
+            if results['saved_msgs']:
+                st.success(f"✅ Saved: {', '.join(results['saved_msgs'])} files to `{results['output_dir']}` directory")
+            else:
+                st.warning("⚠️ No files saved (no formats selected)")
+        else:
+            # UPLOAD MODE: Show download buttons
+            if results['download_data']:
+                st.success(f"✅ Processed {results['selected_count']} files. Download buttons below:")
+                st.markdown("### 📥 Download Processed Files")
+                
+                # Group downloads by filename
+                files_by_name = {}
+                for base_name, fmt, data in results['download_data']:
+                    if base_name not in files_by_name:
+                        files_by_name[base_name] = []
+                    files_by_name[base_name].append((fmt, data))
+                
+                # Create download buttons for each file
+                for base_name, formats in files_by_name.items():
+                    st.markdown(f"**{base_name}**")
+                    cols = st.columns(len(formats))
+                    for idx, (fmt, data) in enumerate(formats):
+                        with cols[idx]:
+                            ext_map = {'json': ('.json', 'application/json'),
+                                     'md': ('.md', 'text/markdown'),
+                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext, mime = ext_map[fmt]
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            st.download_button(
+                                label_map[fmt],
+                                data=data,
+                                file_name=f"{base_name}{ext}",
+                                mime=mime,
+                                key=f"download_refresh_{base_name}_{fmt}",
+                                use_container_width=True
+                            )
+                    st.divider()
+            else:
+                st.warning("⚠️ No files processed")
+        
+        if results['errors']:
+            with st.expander("Errors encountered"):
+                for e in results['errors']:
+                    st.error(e)
+        
+        # Show status messages
+        st.success(f"✅ **Processing complete:** {results['selected_count'] - len(results['errors'])}/{results['selected_count']} files successful")
+        
+        if results['db_records_created'] > 0:
+            st.info(f"📊 **Database updated:** {results['db_records_created']} runs recorded (sidebar stats refreshed!)")
+        else:
+            st.warning("⚠️ **Database not updated:** No runs were recorded. Check errors above.")
+        
+        if results['checkpoint_stats']:
+            st.info(f"📋 **Checkpoint saved:** ${results['checkpoint_stats'].get('total_cost_usd', 0.0):.4f} total cost")
+            if results['checkpoint_path']:
+                st.caption(f"📁 Checkpoint location: `{results['checkpoint_path']}`")
+        
+        # Cleanup uploaded files
+        if results['uploaded_files_to_clean']:
+            try:
+                for img_path in results['uploaded_files_to_clean']:
+                    Path(img_path).unlink(missing_ok=True)
+                st.caption(f"🗑️ Cleaned up {len(results['uploaded_files_to_clean'])} uploaded file(s)")
+            except Exception:
+                pass
+            
+            # Clear session state
+            if 'uploaded_images' in st.session_state:
+                remaining = [img for img in st.session_state['uploaded_images'] 
+                            if img not in results['uploaded_files_to_clean']]
+                st.session_state['uploaded_images'] = remaining
+                st.session_state['selected_images'] = []
+        
+        # Clear the stored results
+        del st.session_state['_last_processing_results']
+        
         return
 
     if process_clicked and selected_template:
@@ -710,9 +1410,28 @@ def run() -> None:
         progress_text = f"Processing {len(selected)} image(s)... Estimated time: {estimated_time} seconds"
         
         with st.spinner(progress_text):
+            gateway = gateway_from_descriptor(descriptor)
+            if unstructured:
+                gateway.prefer_json_mode = False
+                gateway.prefer_tools = False
+            # Update checkpoint run context if folder-based
+            base_folder_raw2 = st.session_state.get("last_folder_path")
+            if base_folder_raw2:
+                try:
+                    base_folder = Path(_normalize_folder_input(base_folder_raw2)).resolve()
+                    checkpoint2 = FolderCheckpoint(base_folder)
+                    checkpoint2.load()
+                    checkpoint2.set_run_context(selected_template_name or None, descriptor.id, unstructured)
+                    # Set project context
+                    active_project = storage.get_active_project()
+                    if active_project:
+                        checkpoint2.set_project_context(active_project.id, active_project.name)
+                    checkpoint2.save()
+                except Exception:
+                    pass
             result = _process_images(
-                provider,
-                api_key,
+                model_ctx,
+                gateway,
                 selected_template,
                 selected,
                 tags,
@@ -721,7 +1440,7 @@ def run() -> None:
         
         # Store result in session state for persistence
         st.session_state['last_result'] = result
-        st.session_state['last_template_name'] = selected_template_name
+        st.session_state['last_template_name'] = selected_template_name or ""
         st.session_state['last_images'] = selected.copy()
         st.session_state['processing_timestamp'] = time.time()
         st.session_state['last_unstructured'] = unstructured
@@ -770,19 +1489,10 @@ def run() -> None:
                 st.warning("🔧 **Server Error Detected**")
                 st.write("The provider's server is experiencing issues. Try:")
                 st.write("• Waiting a few minutes and trying again")
-                st.write("• Using a different model from the same provider")
-                st.write("• Switching to a different provider in Settings")
-                
-                # Show alternative providers if available
-                other_providers = [p for p in storage.list_providers() if p.id != provider.id]
-                if other_providers:
-                    st.info(f"💡 Alternative providers available: {', '.join([p.name for p in other_providers])}")
+                st.write("• Asking an administrator to verify the server configuration")
             elif "401" in error_msg or "403" in error_msg or "authentication" in error_msg:
                 st.warning("🔑 **Authentication Issue**")
-                st.write("There may be an issue with your API key. Check:")
-                st.write("• API key is valid and active")
-                st.write("• API key has sufficient credits/quota")
-                st.write("• API key has permissions for the selected model")
+                st.write("The configured server credentials may be invalid. Contact an administrator to refresh secrets or tokens.")
             elif "429" in error_msg or "rate" in error_msg:
                 st.warning("⏱️ **Rate Limit**")
                 st.write("You've hit the rate limit. Try:")
@@ -791,15 +1501,15 @@ def run() -> None:
                 st.write("• Upgrading your API plan for higher limits")
             elif "timeout" in error_msg or "408" in error_msg:
                 st.warning("⏰ **Timeout Error**")
-                # Re-check if local model (is_local was defined earlier but might be out of scope)
-                is_local_error_check = "localhost" in (provider.base_url or "") or "127.0.0.1" in (provider.base_url or "")
+                base_url_lower = (descriptor.base_url or "").lower()
+                is_local_error_check = any(token in base_url_lower for token in ("localhost", "127.0.0.1", "0.0.0.0"))
                 if is_local_error_check:
                     st.write("Local models can be slow. Try:")
-                    st.write("• Increasing the timeout in Settings (current: " + str(int(provider.timeout_s or 120)) + "s)")
+                    st.write("• Increasing the server timeout (current: " + str(int(descriptor.timeouts.total_s)) + "s)")
                     st.write("• Using a smaller model")
                     st.write("• Reducing max_output_tokens")
                     st.write("• Processing one image at a time")
-                    if provider.timeout_s and provider.timeout_s < 300:
+                    if descriptor.timeouts.total_s < 300:
                         st.info("💡 Consider increasing timeout to 300+ seconds for local models")
                 else:
                     st.write("The request took too long. Try:")
@@ -984,9 +1694,10 @@ def run() -> None:
                     st.session_state['last_usage'] = {
                         'usage': usage,
                         'provider_info': {
-                            'model_id': provider.model_id,
-                            'max_output_tokens': provider.default_max_output_tokens,
-                            'catalog_caps_json': provider.catalog_caps_json
+                            'model_id': descriptor.id,
+                            'max_output_tokens': descriptor.max_output_tokens,
+                            'capabilities': model_ctx.caps,
+                            'pricing': model_ctx.pricing,
                         }
                     }
                 
@@ -1001,22 +1712,34 @@ def run() -> None:
                     st.write(f"**Total tokens:** {usage_data.get('total_tokens', 0):,}")
                     
                     # Warning if output seems truncated
-                    max_requested = int(provider.default_max_output_tokens) if provider.default_max_output_tokens else 4096
-                    if output_tokens < 250 and max_requested > 1000:
-                        st.warning(f"⚠️ Output may be truncated: only {output_tokens} tokens generated out of {max_requested} requested. Check your model's configuration.")
+                    limit_tokens = descriptor.max_output_tokens if descriptor.max_output_tokens not in (None, 0) else 4096
+                    if output_tokens < 250 and limit_tokens > 1000:
+                        st.warning(f"⚠️ Output may be truncated: only {output_tokens} tokens generated out of {limit_tokens} requested. Check your model's configuration.")
                     
                     # Calculate cost if pricing available
-                    if provider.catalog_caps_json:
-                        from app.core.cost import cost_from_usage
-                        cost_info = cost_from_usage(usage_data, provider.catalog_caps_json)
-                        if cost_info and cost_info.get("total", 0) > 0:
-                            st.write(f"**Estimated cost:** ${cost_info['total']:.4f}")
+                    if model_ctx.pricing:
+                        cost_info = cost_from_usage(usage_data, model_ctx.pricing)
+                        total_cost = cost_info.get("total_usd") if cost_info else None
+                        if total_cost:
+                            # USD + INR (if available)
+                            try:
+                                rate = get_usd_to_inr()
+                                if rate:
+                                    inr = convert_usd_to_inr(float(total_cost), rate=rate)
+                                    if inr is not None:
+                                        st.write(f"**Estimated cost:** ${float(total_cost):.4f} • ₹{inr:.2f} (USD→INR {rate})")
+                                    else:
+                                        st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
+                                else:
+                                    st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
+                            except Exception:
+                                st.write(f"**Estimated cost:** ${float(total_cost):.4f}")
                             
                             # Track cumulative cost in session
                             if process_clicked:
                                 if 'cumulative_cost' not in st.session_state:
                                     st.session_state['cumulative_cost'] = 0.0
-                                st.session_state['cumulative_cost'] += cost_info['total']
+                                st.session_state['cumulative_cost'] += float(total_cost)
                             
                             # Show cumulative cost if multiple runs
                             if 'cumulative_cost' in st.session_state:
@@ -1027,14 +1750,14 @@ def run() -> None:
                 try:
                     # Calculate cost if pricing info available
                     cost_usd = None
-                    if result.get("usage") and provider.catalog_caps_json:
-                        cost_info = cost_from_usage(result["usage"], provider.catalog_caps_json)
+                    if result.get("usage") and model_ctx.pricing:
+                        cost_info = cost_from_usage(result["usage"], model_ctx.pricing)
                         if cost_info:
-                            cost_usd = cost_info.get("total")
+                            cost_usd = cost_info.get("total_usd")
                     
                     run = storage.record_run(
-                        provider_id=provider.id,
-                        template_id=selected_template.id,
+                        provider_id=model_ctx.provider_record.id,
+                        template_id=(getattr(selected_template, 'id', None) or None),
                         input_images=selected,
                         output=result["output"],
                         cost_usd=cost_usd,

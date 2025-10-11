@@ -7,19 +7,43 @@ import httpx
 from .provider_endpoints import get_provider_base_urls
 
 
-LOCAL_PROVIDER_NAMES: Dict[str, str] = {
-    "lmstudio": "LM Studio",
-    "ollama": "Ollama",
-}
-
-
 def is_local_provider(provider_id: str) -> bool:
-    return (provider_id or "").strip().lower() in LOCAL_PROVIDER_NAMES
+    """Check if provider has local endpoint (localhost or private IP).
+    
+    This is now a heuristic check. Proper way is via Excel 'is_local' flag.
+    """
+    from .provider_endpoints import get_provider_base_urls
+    pid = (provider_id or "").strip().lower()
+    if not pid:
+        return False
+    
+    endpoints = get_provider_base_urls(pid)
+    if not endpoints:
+        return False
+    
+    url = endpoints[0].get("url", "").lower()
+    local_indicators = [
+        "localhost", "127.0.0.1", "0.0.0.0",
+        "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+        "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+        "172.30.", "172.31.",
+        "10.",
+        ".local", ".lan",
+    ]
+    return any(indicator in url for indicator in local_indicators)
 
 
 def list_local_providers() -> List[tuple[str, str]]:
-    """Return [(provider_id, provider_name), ...] for built-in local providers."""
-    return [(pid, name) for pid, name in LOCAL_PROVIDER_NAMES.items()]
+    """Return [(provider_id, provider_name), ...] for known local providers.
+    
+    Note: This should ideally come from Excel with is_local flag.
+    """
+    # Basic well-known local providers
+    return [
+        ("lmstudio", "LM Studio"),
+        ("ollama", "Ollama"),
+    ]
 
 
 def _openai_models(base_url: str, timeout: float = 2.0) -> List[str]:
@@ -42,11 +66,20 @@ def _openai_models(base_url: str, timeout: float = 2.0) -> List[str]:
         return []
 
 
-def _ollama_fallback_models(timeout: float = 2.0) -> List[str]:
-    """Fallback: query Ollama native API for tags if /v1/models not available."""
+def _ollama_fallback_models(base_url: str, timeout: float = 2.0) -> List[str]:
+    """Fallback: query Ollama native API for tags if /v1/models not available.
+    
+    Args:
+        base_url: The base URL from provider config (e.g., http://localhost:11434/v1)
+    """
+    # Convert OpenAI-compatible endpoint to native Ollama API
+    # e.g., http://localhost:11434/v1 -> http://localhost:11434/api/tags
+    native_base = base_url.rstrip("/").replace("/v1", "")
+    tags_url = f"{native_base}/api/tags"
+    
     try:
         with httpx.Client(timeout=timeout) as client:
-            r = client.get("http://localhost:11434/api/tags")
+            r = client.get(tags_url)
             r.raise_for_status()
             data = r.json()
             models = data.get("models") if isinstance(data, dict) else None
@@ -80,8 +113,8 @@ def discover_provider_models(provider_id: str) -> Dict[str, Any]:
         ids = _openai_models(base_url)
 
     # Ollama fallback if needed
-    if pid == "ollama" and not ids:
-        ids = _ollama_fallback_models()
+    if pid == "ollama" and not ids and base_url:
+        ids = _ollama_fallback_models(base_url)
 
     models: Dict[str, Any] = {}
     for mid in ids:

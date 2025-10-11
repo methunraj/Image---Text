@@ -35,49 +35,11 @@ def get_provider_base_urls(provider_id: str) -> List[Dict[str, str]]:
     pmap = (catalog.get("provider_breakdown") or {}) if isinstance(catalog, dict) else {}
     rec = pmap.get(pid, {}) if isinstance(pmap, dict) else {}
 
-    # Alibaba: provide 2 explicit endpoints with neutral labels
-    if pid == "alibaba":
-        return [
-            {
-                "label": "International",
-                "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            },
-            {
-                "label": "China (Mainland)",
-                "url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            },
-        ]
-
     url = rec.get("base_url") if isinstance(rec, dict) else None
 
-    # Some entries in catalog are descriptive and not actual URLs; validate prefix
+    # Validate that we have a proper URL from catalog
     if isinstance(url, str) and url.strip().lower().startswith(("http://", "https://")):
         return [{"label": "Default", "url": url.strip()}]
 
-    # Fallbacks for common providers if catalog missing or non-URL
-    fallback = {
-        "openai": "https://api.openai.com/v1",
-        "anthropic": "https://api.anthropic.com/v1",
-        "google": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "mistral": "https://api.mistral.ai/v1",
-        "perplexity": "https://api.perplexity.ai",
-        "groq": "https://api.groq.com/openai/v1",
-        "together": "https://api.together.xyz/v1",
-        "fireworks-ai": "https://api.fireworks.ai/inference/v1",
-        "deepseek": "https://api.deepseek.com/v1",
-        "moonshotai-cn": "https://api.moonshot.cn/v1",
-        "moonshotai": "https://api.moonshot.ai/v1",
-        "openrouter": "https://openrouter.ai/api/v1",
-        "google-vertex": "https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/endpoints/openapi",
-        "amazon-bedrock": "https://{bedrock-runtime-endpoint}/openai/v1",
-        "groq": "https://api.groq.com/openai/v1",
-        # Local providers
-        "lmstudio": "http://localhost:1234/v1",
-        "ollama": "http://localhost:11434/v1",
-    }
-
-    if pid in fallback:
-        return [{"label": "Default", "url": fallback[pid]}]
-
-    # Final fallback to OpenAI
-    return [{"label": "Default", "url": "https://api.openai.com/v1"}]
+    # No fallback - provider must be properly configured in baseurl.json or Excel
+    return []

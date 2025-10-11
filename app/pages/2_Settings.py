@@ -22,10 +22,12 @@ if str(_ROOT) not in sys.path:
 
 from app.core import ui as core_ui
 from app.core import storage
+from app.core import template_assets
+from app.core.model_registry import ModelRegistryError, active_model, config_metadata, ensure_registry, reload_registry
 from app.core.models_dev import lookup_model, get_cached_catalog, get_logo_path
 from app.core.provider_endpoints import get_provider_base_urls
 from app.core.local_models import is_local_provider, list_local_providers, discover_provider_models
-from app.core.provider_openai import OpenAIProvider, OAIGateway, tiny_png_data_url
+from app.core.provider_openai import OAIGateway, tiny_png_data_url
 from app.core.templating import Example, RenderedMessages, render_user_prompt
 
 
@@ -63,6 +65,10 @@ def _encrypt(kms: Optional[Fernet], plaintext: str) -> Optional[str]:
 def _decrypt(kms: Optional[Fernet], token: Optional[str]) -> Optional[str]:
     if not kms or not token:
         return None
+    try:
+        return kms.decrypt(token.encode()).decode()
+    except (InvalidToken, Exception):
+        return None
 
 
 def _get_api_key_for_provider_code(provider_code: str) -> Optional[str]:
@@ -98,10 +104,6 @@ def _set_api_key_for_provider_code(provider_code: str, key_storage: str, new_key
     enc = _encrypt(kms, new_key) if new_key else None
     storage.set_provider_key(code, "encrypted" if enc else "session", enc)
     return ("encrypted" if enc else "session"), enc
-    try:
-        return kms.decrypt(token.encode()).decode()
-    except (InvalidToken, Exception):
-        return None
 
 
 def _get_api_key_for_provider(pid: int, key_storage: str, enc: Optional[str]) -> Optional[str]:
@@ -928,7 +930,8 @@ def _custom_model_form() -> Optional[Dict[str, Any]]:
             st.rerun()
     
     # Add provider-specific guidance
-    with st.info("ℹ️ Provider-Specific Notes"):
+    st.info("ℹ️ Provider-Specific Notes")
+    with st.container(border=True):
         st.markdown("""
         **OpenRouter:** 
         - Use model IDs like `openai/gpt-4-vision-preview` or `anthropic/claude-3-opus`
@@ -1423,6 +1426,7 @@ def _to_data_url(file) -> str:
 def _template_management() -> None:
     """Display template management interface."""
     storage.init_db()
+    template_assets.sync_from_assets()
     
     # Check if template was just saved
     if st.session_state.get("template_saved"):
@@ -1474,18 +1478,27 @@ Respond ONLY with JSON."""
                     if existing:
                         st.warning("Starter template already exists!")
                     else:
+                        starter_yaml = {
+                            "name": starter_name,
+                            "description": "A basic template for extracting common document fields",
+                            "system_prompt": starter_system,
+                            "user_prompt": starter_user,
+                            "schema": starter_schema,
+                            "examples": [],
+                        }
                         new_tpl = storage.create_template(
                             starter_name,
-                            content="",
                             schema_json=starter_schema,
-                            examples_json=[]
-                        )
-                        storage.update_template(
-                            new_tpl.id,
+                            examples_json=[],
                             description="A basic template for extracting common document fields",
                             system_prompt=starter_system,
-                            user_prompt=starter_user
+                            user_prompt=starter_user,
+                            yaml_blob=yaml.safe_dump(starter_yaml, sort_keys=False),
                         )
+                        try:
+                            template_assets.export_to_assets(new_tpl)
+                        except Exception as exc:
+                            st.warning(f"Starter template created but could not mirror to assets: {exc}")
                         st.success("✅ Starter template created!")
                         st.rerun()
                         
@@ -1504,23 +1517,51 @@ Respond ONLY with JSON."""
         name = st.text_input("Name", value=("" if is_new else tpl.name))
         desc = st.text_input("Description (optional)", value=("" if is_new else (tpl.description or "")))
         
+        # Template type selector: allow creating non-schema templates easily
+        template_type = st.radio(
+            "Template Type",
+            options=["Structured (Schema)", "Structured (Auto JSON)", "Unstructured (Markdown)"],
+            horizontal=True,
+            help="Choose whether this template enforces a schema, guides the model to produce JSON without a schema, or captures unstructured text.",
+            key="tpl_type_radio",
+            index=(0 if not is_new and tpl and (tpl.schema_json or {}) else 0),
+        )
+        
         # Use tabs for better organization
         tab_prompts, tab_schema, tab_examples = st.tabs(["📝 Prompts", "🔧 Schema", "📚 Examples"])
         
         with tab_prompts:
+            # Defaults vary by template type when creating new templates
+            if is_new:
+                if template_type == "Structured (Schema)":
+                    default_system = "Return ONLY valid JSON matching the schema. No code fences. Use null for missing fields."
+                    default_user = (
+                        "You are a precise JSON generator. Use the schema to format results.\n{schema}\n\n{examples}\n"
+                        "Respond with only JSON."
+                    )
+                elif template_type == "Structured (Auto JSON)":
+                    default_system = (
+                        "You are a precise JSON generator. Analyze the image and output ONLY valid JSON.")
+                    default_user = (
+                        "Extract information from the image. Document type: {doc_type}. Locale: {locale}.\n"
+                        "Today's date is {today}. Respond with a single JSON object (or array if multiple entries). Return JSON ONLY."
+                    )
+                else:  # Unstructured
+                    default_system = ""
+                    default_user = "Describe the document and extract key information in Markdown."
+            else:
+                default_system = tpl.system_prompt or ""
+                default_user = tpl.user_prompt or ""
+
             system_prompt = st.text_area(
-                "System Prompt", 
-                value=("" if is_new else (tpl.system_prompt or "")), 
+                "System Prompt",
+                value=default_system,
                 height=120,
                 help="Instructions for the AI assistant"
             )
             user_prompt = st.text_area(
                 "User Prompt",
-                value=(
-                    "You are a precise JSON generator. Use the schema to format results.\n{schema}\n\n{examples}\nRespond with only JSON."
-                    if is_new
-                    else (tpl.user_prompt or "")
-                ),
+                value=default_user,
                 height=200,
                 help="Supports {schema}, {examples}, {today}, {locale}, {doc_type}",
             )
@@ -1549,11 +1590,13 @@ Respond ONLY with JSON."""
                 validation_message = f"❌ Schema JSON invalid: {str(e)[:100]}"
             
             # Show validation banner
-            if schema_text.strip():
+            if schema_text.strip() and template_type == "Structured (Schema)":
                 if schema_valid:
                     st.success(validation_message, icon="✅")
                 else:
                     st.error(validation_message, icon="❌")
+            elif template_type != "Structured (Schema)":
+                st.info("Schema is optional for this template type and will be ignored at runtime.")
 
         with tab_examples:
             st.markdown("Few-shot Examples (0–3)")
@@ -1600,7 +1643,10 @@ Respond ONLY with JSON."""
 
     colA, colB, colC = st.columns(3)
     with colA:
-        save_clicked = st.button("Save", use_container_width=True, disabled=not schema_valid or not name.strip())
+        # Allow saving even if schema is invalid when schema is not required
+        require_schema = template_type == "Structured (Schema)"
+        disable_save = (require_schema and not schema_valid) or not name.strip()
+        save_clicked = st.button("Save", use_container_width=True, disabled=disable_save)
     with colB:
         clone_clicked = st.button("Clone", use_container_width=True, disabled=is_new)
     with colC:
@@ -1612,30 +1658,39 @@ Respond ONLY with JSON."""
             st.error("Template name cannot be empty")
             return
 
+        serialized_examples = [asdict(e) for e in examples]
+        # If schema is not required, ignore provided schema at runtime by storing empty {}
+        if template_type != "Structured (Schema)":
+            schema_obj = {} if not schema_obj else schema_obj  # ensure serializable
+
         body = {
             "name": normalized_name,
             "description": desc or None,
             "system_prompt": system_prompt or None,
             "user_prompt": user_prompt or None,
             "schema": schema_obj,
-            "examples": [asdict(e) for e in examples],
+            "examples": serialized_examples,
             "version_tag": (tpl.version_tag if tpl else None),
         }
         yaml_blob = yaml.safe_dump(body, sort_keys=False)
         if is_new:
             existing_tpl = storage.get_template_by_name(normalized_name)
             if existing_tpl:
-                storage.update_template(
+                updated_tpl = storage.update_template(
                     existing_tpl.id,
                     name=normalized_name,
                     description=desc or None,
                     system_prompt=system_prompt or None,
                     user_prompt=user_prompt or None,
                     schema_json=schema_obj,
-                    examples_json=[asdict(e) for e in examples],
+                    examples_json=serialized_examples,
                     yaml_blob=yaml_blob,
                     version_tag=existing_tpl.version_tag,
                 )
+                try:
+                    template_assets.export_to_assets(updated_tpl)
+                except Exception as exc:
+                    st.warning(f"Saved to database but could not mirror to assets: {exc}")
                 st.success("✅ Existing template overwritten with latest changes.")
                 st.session_state.template_saved = True
                 st.session_state.saved_template_name = normalized_name
@@ -1644,17 +1699,17 @@ Respond ONLY with JSON."""
                 try:
                     tnew = storage.create_template(
                         normalized_name,
-                        content="",
                         schema_json=schema_obj,
-                        examples_json=[asdict(e) for e in examples],
-                    )
-                    storage.update_template(
-                        tnew.id,
+                        examples_json=serialized_examples,
                         description=desc or None,
                         system_prompt=system_prompt or None,
                         user_prompt=user_prompt or None,
                         yaml_blob=yaml_blob,
                     )
+                    try:
+                        template_assets.export_to_assets(tnew)
+                    except Exception as exc:
+                        st.warning(f"Template created but could not mirror to assets: {exc}")
                     st.success("✅ Template created successfully!")
                     st.session_state.template_saved = True
                     st.session_state.saved_template_name = normalized_name
@@ -1662,16 +1717,20 @@ Respond ONLY with JSON."""
                 except Exception as exc:
                     st.error(f"Could not save template: {exc}")
         else:
-            storage.update_template(
+            updated_tpl = storage.update_template(
                 tpl.id,
                 name=normalized_name,
                 description=desc or None,
                 system_prompt=system_prompt or None,
                 user_prompt=user_prompt or None,
                 schema_json=schema_obj,
-                examples_json=[asdict(e) for e in examples],
+                examples_json=serialized_examples,
                 yaml_blob=yaml_blob,
             )
+            try:
+                template_assets.export_to_assets(updated_tpl)
+            except Exception as exc:
+                st.warning(f"Saved to database but could not mirror to assets: {exc}")
             st.success("✅ Template saved successfully!")
             # Save the success state and template name to session
             st.session_state.template_saved = True
@@ -1681,263 +1740,398 @@ Respond ONLY with JSON."""
     if clone_clicked and tpl:
         clone_name = st.text_input("Clone As Name", value=f"{tpl.name} (copy)")
         if st.button("Confirm Clone"):
-            t2 = storage.create_template(
-                clone_name.strip(), content="", schema_json=tpl.schema_json, examples_json=tpl.examples_json
-            )
-            storage.update_template(
-                t2.id,
-                description=tpl.description,
-                system_prompt=tpl.system_prompt,
-                user_prompt=tpl.user_prompt,
-                yaml_blob=tpl.yaml_blob,
-                version_tag=tpl.version_tag,
-            )
-            st.success("Template cloned")
-            st.rerun()
+            new_name = clone_name.strip()
+            try:
+                cloned_tpl = storage.create_template(
+                    new_name,
+                    schema_json=tpl.schema_json,
+                    examples_json=tpl.examples_json,
+                    description=tpl.description,
+                    system_prompt=tpl.system_prompt,
+                    user_prompt=tpl.user_prompt,
+                    yaml_blob=tpl.yaml_blob,
+                    version_tag=tpl.version_tag,
+                )
+                try:
+                    template_assets.export_to_assets(cloned_tpl)
+                except Exception as exc:
+                    st.warning(f"Template cloned but could not mirror to assets: {exc}")
+                st.success("Template cloned")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed to clone template: {exc}")
 
     if del_clicked and tpl:
+        try:
+            template_assets.delete_from_assets(tpl)
+        except Exception as exc:
+            st.warning(f"Could not remove asset file: {exc}")
         storage.delete_template(tpl.id)
         st.warning("Template deleted")
         st.rerun()
 
 
-def run() -> None:
-    load_dotenv(override=False)
-    st.title("Settings")
+def _pdf_tools() -> None:
+    """PDF to Image converter interface."""
+    from app.core.pdf_convert import is_available as pdf_available, convert_pdf_to_images
+    from app.core.checkpoints import FolderCheckpoint
+    
+    if not pdf_available():
+        st.warning("⚠️ PDF conversion requires pypdfium2. Install with: `pip install pypdfium2`")
+        return
+    
+    st.markdown("Convert PDF pages to JPEG/PNG images for processing with vision models.")
+    
+    pdfs = st.file_uploader("Select PDF(s)", type=["pdf"], accept_multiple_files=True, key="pdf_uploader_settings")
+    
+    default_dir = str((Path.home() / "Documents")) if (Path.home() / "Documents").exists() else str(Path.cwd())
+    out_folder = st.text_input(
+        "Output folder",
+        value=st.session_state.get("pdf_out_folder_settings", default_dir),
+        help="Pages will be saved here as images",
+        key="pdf_out_folder_settings_input"
+    )
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        dpi = st.number_input("DPI", min_value=72, max_value=600, value=200, step=10, key="pdf_dpi_settings")
+    with col2:
+        fmt = st.selectbox("Format", options=["PNG", "JPEG"], index=0, key="pdf_format_settings")
+    with col3:
+        overwrite = st.checkbox("Overwrite existing", value=False, key="pdf_overwrite_settings")
+    
+    page_spec = st.text_input("Pages (optional)", placeholder="e.g., 1-5,8", help="Leave blank to convert all pages", key="pdf_page_spec_settings")
+    
+    convert_clicked = st.button("Convert PDF → Images", type="primary")
+    
+    if convert_clicked:
+        if not pdfs:
+            st.error("Please select at least one PDF.")
+        else:
+            try:
+                import importlib
+                upload_module = importlib.import_module("app.pages.1_Upload_and_Process")
+                _normalize_folder_input = upload_module._normalize_folder_input
+                _find_images_in_folder = upload_module._find_images_in_folder
+                _sanitize_filename = upload_module._sanitize_filename
+                
+                out_dir = Path(_normalize_folder_input(out_folder)).resolve()
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                st.error(f"Cannot use output folder: {e}")
+            else:
+                created_total, skipped_total, errors_total = 0, 0, 0
+                created_paths: List[str] = []
+                skipped_paths: List[str] = []
+                
+                # Save PDFs to temp and convert
+                tmp_root = Path("data/uploads/pdf_tmp")
+                tmp_root.mkdir(parents=True, exist_ok=True)
+                
+                progress = st.progress(0.0, text="Converting PDFs...")
+                
+                for idx, f in enumerate(pdfs):
+                    try:
+                        tmp_path = tmp_root / _sanitize_filename(f.name)
+                        tmp_path.write_bytes(f.read())
+                        new, skipped, errs = convert_pdf_to_images(
+                            tmp_path, out_dir,
+                            dpi=dpi, fmt=fmt,
+                            overwrite=overwrite,
+                            page_spec=page_spec.strip() or None
+                        )
+                        created_total += len(new)
+                        skipped_total += len(skipped)
+                        errors_total += len(errs)
+                        created_paths.extend(new)
+                        skipped_paths.extend(skipped)
+                        progress.progress((idx + 1) / len(pdfs), text=f"Converted {idx + 1}/{len(pdfs)} PDFs")
+                    except Exception as e:
+                        st.warning(f"{f.name}: {e}")
+                
+                progress.empty()
+                
+                # Update checkpoint for the folder
+                try:
+                    cp = FolderCheckpoint(out_dir)
+                    cp.load()
+                    imgs_in_folder = _find_images_in_folder(out_dir, True)
+                    cp.ensure_entries(imgs_in_folder)
+                    cp.save()
+                except Exception:
+                    pass
+                
+                st.session_state["pdf_out_folder_settings"] = str(out_dir)
+                st.success(f"✅ Converted: {created_total} new page(s) • Skipped: {skipped_total} • Errors: {errors_total}")
+                
+                if created_total > 0:
+                    st.info(f"💡 Images saved to: `{out_dir}`\n\nGo to **Upload & Process** to select this folder and process the images.")
+
+
+def _project_management() -> None:
+    """Project management interface."""
     storage.init_db()
     
-    # Get active provider for sidebar
-    active = storage.get_active_provider()
+    projects = storage.list_projects()
+    active_project = storage.get_active_project()
     
-    with st.sidebar:
-        prof_name = active.name if active else "None"
-        logo = active.logo_path if active else None
-        core_ui.status_chip("Active Profile", prof_name, logo_path=logo)
-    
-    # Main tabs: Model and Template
-    tab_model, tab_template = st.tabs(["🤖 Model", "📝 Template"])
-    
-    with tab_model:
-        st.markdown("### Configure AI Model")
-        st.caption("Select and configure the model for image-to-JSON extraction")
+    # Create new project section
+    with st.container(border=True):
+        st.markdown("#### Create New Project")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            new_name = st.text_input("Project Name", key="new_project_name", placeholder="e.g., Q1 2024 Invoices")
+            new_desc = st.text_area("Description (optional)", key="new_project_desc", placeholder="Describe the project purpose...")
+        with col2:
+            st.write("")  # Spacing
+            st.write("")
+            create_clicked = st.button("Create Project", type="primary", use_container_width=True)
         
-        # Profile Management Section
-        providers = storage.list_providers()
-        if providers:
-            st.markdown("#### 📂 Saved Profiles")
-            col1, col2, col3 = st.columns([3, 1, 1])
+        if create_clicked:
+            if not new_name.strip():
+                st.error("Project name cannot be empty")
+            else:
+                try:
+                    new_proj = storage.create_project(new_name.strip(), new_desc.strip() or None)
+                    st.success(f"✅ Project '{new_proj.name}' created!")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+    
+    st.divider()
+    
+    # List existing projects
+    st.markdown("#### Existing Projects")
+    
+    if not projects:
+        st.info("No projects yet. Create one above to get started!")
+        return
+    
+    for proj in projects:
+        with st.container(border=True):
+            col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
             
             with col1:
-                profile_names = ["Select a saved profile..."] + [p.name for p in providers]
-                selected_profile_name = st.selectbox(
-                    "Load Profile",
-                    options=profile_names,
-                    index=0,
-                    help="Select a previously saved profile to load its settings"
-                )
+                is_active_marker = "🟢 " if (active_project and proj.id == active_project.id) else ""
+                st.markdown(f"**{is_active_marker}{proj.name}**")
+                if proj.description:
+                    st.caption(proj.description)
             
             with col2:
-                if selected_profile_name != "Select a saved profile...":
-                    if st.button("✅ Set Active", use_container_width=True):
-                        selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                        if selected_provider:
-                            storage.set_active_provider(selected_provider.id)
-                            # Hydrate session with the stored API key (encrypted or session) for seamless usage
-                            try:
-                                key = _get_api_key_for_provider(
-                                    selected_provider.id,
-                                    selected_provider.key_storage,
-                                    selected_provider.api_key_enc,
-                                )
-                                if key:
-                                    keys: Dict[int, str] = st.session_state.setdefault("_api_keys", {})
-                                    keys[selected_provider.id] = key
-                            except Exception:
-                                pass
-                            st.success(f"'{selected_profile_name}' is now active!")
-                            st.rerun()
+                stats = storage.get_project_stats(proj.id)
+                st.metric("Images", stats['total_images'])
             
             with col3:
-                if selected_profile_name != "Select a saved profile...":
-                    if st.button("🗑️ Delete", use_container_width=True):
-                        selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                        if selected_provider:
-                            storage.delete_provider(selected_provider.id)
-                            st.warning(f"Deleted profile: {selected_profile_name}")
+                st.metric("Cost", f"${stats['total_cost_usd']:.4f}")
+            
+            with col4:
+                if active_project and proj.id == active_project.id:
+                    st.success("Active")
+                else:
+                    if st.button("Set Active", key=f"activate_{proj.id}"):
+                        storage.set_active_project(proj.id)
+                        st.rerun()
+            
+            # Action buttons
+            col_edit, col_report, col_del = st.columns([1, 1, 1])
+            
+            with col_edit:
+                if st.button("✏️ Edit", key=f"edit_{proj.id}"):
+                    st.session_state[f"editing_{proj.id}"] = True
+                    st.rerun()
+            
+            with col_report:
+                from app.core.report_generator import save_project_report
+                if st.button("📊 Generate Report", key=f"report_{proj.id}"):
+                    try:
+                        export_dir = Path("export")
+                        report_path = save_project_report(proj.id, export_dir)
+                        st.success(f"✅ Report saved to: `{report_path}`")
+                        
+                        # Offer download
+                        report_content = report_path.read_text(encoding="utf-8")
+                        st.download_button(
+                            "📥 Download Report",
+                            data=report_content,
+                            file_name=report_path.name,
+                            mime="text/markdown",
+                            key=f"download_report_{proj.id}"
+                        )
+                    except Exception as e:
+                        st.error(f"Failed to generate report: {e}")
+            
+            with col_del:
+                if st.button("🗑️ Delete", key=f"delete_{proj.id}"):
+                    try:
+                        storage.delete_project(proj.id)
+                        st.success(f"Deleted project '{proj.name}'")
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+            
+            # Edit mode
+            if st.session_state.get(f"editing_{proj.id}", False):
+                st.markdown("##### Edit Project")
+                edit_name = st.text_input("Name", value=proj.name, key=f"edit_name_{proj.id}")
+                edit_desc = st.text_area("Description", value=proj.description or "", key=f"edit_desc_{proj.id}")
+                
+                col_save, col_cancel = st.columns(2)
+                with col_save:
+                    if st.button("Save", key=f"save_edit_{proj.id}"):
+                        try:
+                            storage.update_project(proj.id, name=edit_name.strip(), description=edit_desc.strip() or None)
+                            st.session_state[f"editing_{proj.id}"] = False
+                            st.success("Project updated!")
                             st.rerun()
-            
-            if selected_profile_name != "Select a saved profile...":
-                # Load the selected profile
-                selected_provider = next((p for p in providers if p.name == selected_profile_name), None)
-                if selected_provider:
-                    st.session_state["selected_profile"] = selected_profile_name
-                    # Display loaded profile configuration
-                    st.success(f"✅ Loaded profile: {selected_profile_name}")
-                    st.divider()
-                    st.markdown("### Loaded Profile Configuration")
-                    _model_configuration({
-                        "model_id": selected_provider.model_id,
-                        "provider_name": selected_provider.name,
-                        "is_loaded_profile": True
-                    })
-            else:
-                st.divider()
-                st.markdown("#### 🆕 Or Configure New Model")
-                
-                # Model selection sub-tabs - only show when no profile selected
-                tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-                
-                selected_model_info = None
-                
-                with tab_catalog:
-                    catalog = get_cached_catalog()
-                    if catalog:
-                        selected_model_info = _model_browser(catalog)
-                        if selected_model_info:
-                            st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                            st.session_state["selected_model"] = selected_model_info
-                    else:
-                        st.error("Could not load models catalog")
-                
-                with tab_custom:
-                    # Check if custom model was already selected
-                    if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                        selected_model_info = st.session_state["selected_model"]
-                        st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-                    
-                    custom_info = _custom_model_form()
-                    if custom_info:
-                        selected_model_info = custom_info
-                        st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                        st.session_state["selected_model"] = selected_model_info
-                
-                # Use session state to persist selection
-                if not selected_model_info and "selected_model" in st.session_state:
-                    selected_model_info = st.session_state["selected_model"]
-                
-                if selected_model_info:
-                    st.divider()
-                    st.markdown("### Connection Configuration")
-                    _model_configuration(selected_model_info)
-                else:
-                    st.info("👆 Select a model from the catalog or add a custom model to configure connection settings")
-        else:
-            # No saved profiles - show new model configuration
-            st.markdown("#### Configure New Model")
-            
-            # Model selection sub-tabs
-            tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-            
-            selected_model_info = None
-            
-            with tab_catalog:
-                catalog = get_cached_catalog()
-                if catalog:
-                    selected_model_info = _model_browser(catalog)
-                    if selected_model_info:
-                        st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                        st.session_state["selected_model"] = selected_model_info
-                else:
-                    st.error("Could not load models catalog")
-            
-            with tab_custom:
-                # Check if custom model was already selected
-                if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                    selected_model_info = st.session_state["selected_model"]
-                    st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-                
-                custom_info = _custom_model_form()
-                if custom_info:
-                    selected_model_info = custom_info
-                    st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                    st.session_state["selected_model"] = selected_model_info
-            
-            # Use session state to persist selection
-            if not selected_model_info and "selected_model" in st.session_state:
-                selected_model_info = st.session_state["selected_model"]
-            
-            if selected_model_info:
-                st.divider()
-                st.markdown("### Connection Configuration")
-                _model_configuration(selected_model_info)
-            else:
-                st.info("👆 Select a model from the catalog or add a custom model to configure connection settings")
-    
-    with tab_template:
-        st.markdown("### Manage Templates")
-        st.caption("Create and manage prompt templates for consistent extraction")
-        _template_management()
+                        except ValueError as e:
+                            st.error(str(e))
+                with col_cancel:
+                    if st.button("Cancel", key=f"cancel_edit_{proj.id}"):
+                        st.session_state[f"editing_{proj.id}"] = False
+                        st.rerun()
 
 
-# Override old run() with streamlined workflow
+# Override old run() with registry-driven workflow
 def run() -> None:  # type: ignore[no-redef]
     load_dotenv(override=False)
     st.title("Settings")
     storage.init_db()
 
-    # Sidebar: show active model
-    active = storage.get_active_provider()
-    with st.sidebar:
-        prof_name = (active.model_id or active.name) if active else "None"
-        logo = active.logo_path if active else None
-        core_ui.status_chip("Active Model", prof_name, logo_path=logo)
+    registry_error: str | None = None
+    registry = None
+    try:
+        registry = ensure_registry()
+    except Exception as exc:
+        registry_error = str(exc)
 
-    # Tabs
-    tab_model, tab_template = st.tabs(["🤖 Model", "📝 Template"])
+    with st.sidebar:
+        try:
+            descriptor = active_model()
+            logo = get_logo_path(descriptor.provider_id)
+            core_ui.status_chip("Active Model", descriptor.label, logo_path=logo)
+        except ModelRegistryError:
+            core_ui.status_chip("Active Model", "Unavailable")
+
+    tab_model, tab_template, tab_pdf, tab_projects = st.tabs(["🤖 Models", "📝 Templates", "📄 PDF Tools", "📁 Projects"])
 
     with tab_model:
-        st.markdown("### Configure AI Model")
-        st.caption("Pick a provider/model; if a key is missing you can add it inline.")
+        st.markdown("### Model Registry")
 
-        catalog = get_cached_catalog()
-        st.markdown("#### Select Model")
-        tab_catalog, tab_custom = st.tabs(["📚 Browse Catalog", "🔧 Custom Model"])
-
-        selected_model_info = None
-        with tab_catalog:
-            if catalog:
-                selected_model_info = _grouped_model_selector(catalog)
-                if selected_model_info:
-                    st.success(f"✅ Selected: {selected_model_info['name']} from {selected_model_info['provider_name']}")
-                    st.session_state["selected_model"] = selected_model_info
-            else:
-                st.error("Could not load models catalog")
-
-        with tab_custom:
-            # Check if custom model was already selected
-            if st.session_state.get("custom_model_selected") and "selected_model" in st.session_state:
-                selected_model_info = st.session_state["selected_model"]
-                st.success(f"✅ Using custom model: {selected_model_info['model_id']}")
-            
-            custom_info = _custom_model_form()
-            if custom_info:
-                selected_model_info = custom_info
-                st.success(f"✅ Using custom model: {custom_info['model_id']}")
-                st.session_state["selected_model"] = selected_model_info
-
-        if not selected_model_info and "selected_model" in st.session_state:
-            # Rehydrate previous selection from session, but only if the provider key exists
-            maybe_saved = st.session_state["selected_model"]
-            pid = (maybe_saved or {}).get("provider_id")
-            if pid and _get_api_key_for_provider_code(pid):
-                selected_model_info = maybe_saved
-            else:
-                # Drop stale selection without key
-                selected_model_info = None
-
-        if selected_model_info:
-            st.divider()
-            st.markdown("### Connection Configuration")
-            _streamlined_model_configuration(selected_model_info)
+        if registry_error:
+            st.error(f"Failed to load registry: {registry_error}")
         else:
-            st.info("👆 Select a provider and model, or add a custom model")
+            metadata = config_metadata()
+            profile = metadata.get("profile", "dev") if metadata else "dev"
+            source_path = metadata.get("source_path") if metadata else "(unknown)"
+            st.caption(f"Profile: `{profile}` • Source: `{source_path}`")
 
-        # Advanced key management removed from default flow to avoid duplicate key entry points
+            reload_clicked = st.button("Reload config", type="primary")
+            if reload_clicked:
+                try:
+                    registry = reload_registry()
+                    st.success("Configuration reloaded successfully")
+                except Exception as exc:  # pragma: no cover
+                    st.error(f"Reload failed: {exc}")
+
+            if registry:
+                try:
+                    default_model = registry.resolve(None)
+                    st.write(f"**Default model:** {default_model.label} ({default_model.provider_label})")
+                    st.write(f"**Route:** {default_model.route}")
+                except ModelRegistryError:
+                    st.warning("No default model configured")
+
+                capabilities_rows: List[Dict[str, Any]] = []
+                # Optional INR rate for display
+                try:
+                    from app.core.currency import get_usd_to_inr
+                    _usd_to_inr_rate = get_usd_to_inr()
+                except Exception:
+                    _usd_to_inr_rate = None
+                
+                # Define formatting functions once (not in loop)
+                def _fmt_usd(v):
+                    return f"{v:.4f}" if v is not None else "—"
+                def _fmt_inr(v):
+                    return f"₹{v:.2f}" if v is not None else "—"
+                
+                for model in sorted(registry.models.values(), key=lambda m: (m.provider_label, m.label)):
+                    if not model.show_in_ui:
+                        continue
+                    caps = model.capabilities
+                    pricing = model.pricing
+                    reasoning = model.reasoning
+                    reasoning_label = "—"
+                    if reasoning and reasoning.provider and reasoning.provider != "none":
+                        parts = [reasoning.provider]
+                        if reasoning.effort_default:
+                            parts.append(str(reasoning.effort_default))
+                        reasoning_label = ", ".join(parts)
+                    # Prefer per million for display; derive from per_1k if needed
+                    in_per_m = pricing.input_per_million if pricing.input_per_million is not None else (pricing.input_per_1k * 1000.0 if pricing.input_per_1k is not None else None)
+                    out_per_m = pricing.output_per_million if pricing.output_per_million is not None else (pricing.output_per_1k * 1000.0 if pricing.output_per_1k is not None else None)
+                    # Calculate INR if rate available
+                    in_inr = (in_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and in_per_m is not None) else None
+                    out_inr = (out_per_m * _usd_to_inr_rate) if (_usd_to_inr_rate and out_per_m is not None) else None
+                    
+                    # Build row dict - always include INR columns if rate is available
+                    row_dict = {
+                        "Provider": model.provider_label,
+                        "Model": model.label,
+                        "Route": model.route,
+                        "Vision": "✅" if caps.vision else "—",
+                        "Tools": "✅" if caps.tools else "—",
+                        "JSON": "✅" if caps.json_mode or caps.structured_output else "—",
+                        "Streaming": "✅" if caps.streaming else "—",
+                        "Context": f"{model.context_window:,}",
+                        "Max Output": model.max_output_tokens or "∞",
+                        "Input $/1M": _fmt_usd(in_per_m),
+                        "Output $/1M": _fmt_usd(out_per_m),
+                    }
+                    
+                    # Add INR columns if exchange rate is available
+                    if _usd_to_inr_rate:
+                        row_dict["Input ₹/1M"] = _fmt_inr(in_inr)
+                        row_dict["Output ₹/1M"] = _fmt_inr(out_inr)
+                    
+                    row_dict["Reasoning"] = reasoning_label
+                    
+                    capabilities_rows.append(row_dict)
+
+                if capabilities_rows:
+                    # Show INR status message
+                    if _usd_to_inr_rate:
+                        st.success(f"💱 Exchange rate active: 1 USD = ₹{_usd_to_inr_rate:.2f} INR (INR columns visible in table below)")
+                    else:
+                        st.info("💡 Set exchange rate below to view INR pricing columns")
+                    
+                    # For dataframe, width expects an int in current Streamlit; keep container width behavior
+                    st.dataframe(capabilities_rows, use_container_width=True)
+                else:
+                    st.info("No models flagged for UI in this profile.")
+
+                st.markdown("#### Policies")
+                policies = registry.policies
+                st.write(
+                    f"• Max concurrent requests: {policies.max_concurrent_requests}\n"
+                    f"• Frontend temperature control: {'enabled' if policies.allow_frontend_temperature else 'disabled'}\n"
+                    f"• Frontend model selection: {'enabled' if policies.allow_frontend_model_selection else 'disabled'}"
+                )
 
     with tab_template:
         st.markdown("### Manage Templates")
         st.caption("Create and manage prompt templates for consistent extraction")
         _template_management()
+    
+    with tab_pdf:
+        st.markdown("### PDF to Image Converter")
+        st.caption("Convert PDF pages to images for processing")
+        _pdf_tools()
+    
+    with tab_projects:
+        st.markdown("### Project Management")
+        st.caption("Create and manage projects to track spending")
+        _project_management()
 
 
 run()

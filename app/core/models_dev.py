@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Callable, Tuple, List
 import time
-from difflib import SequenceMatcher
 
 try:
     import httpx
@@ -111,26 +110,9 @@ def _fetch_and_cache_catalog(max_age_seconds: int = 24 * 3600) -> Dict[str, Any]
         except Exception:
             pass
     
-    # Minimal fallback if all else fails
+    # If all else fails, return empty dict (caller should handle gracefully)
     if not data:
-        data = {
-            "openai": {
-                "id": "openai",
-                "name": "OpenAI",
-                "models": {
-                    "gpt-4o-mini": {
-                        "id": "gpt-4o-mini",
-                        "name": "GPT-4o mini",
-                        "modalities": {"input": ["text", "image"], "output": ["text"]},
-                        "cost": {"input": 0.00015, "output": 0.0006},
-                        "limit": {"context": 128000, "output": 16384},
-                        "knowledge": "2023-10",
-                        "release_date": "2024-07-18",
-                        "last_updated": "2024-07-18"
-                    }
-                }
-            }
-        }
+        data = {}
     
     # Cache to disk
     try:
@@ -148,22 +130,6 @@ def _ensure_catalog_loaded() -> None:
     if not _catalog_loaded:
         catalog_data = _fetch_and_cache_catalog()
         _build_indices(catalog_data)
-
-
-def _fuzzy_match_by_name(search_name: str) -> Optional[Dict[str, Any]]:
-    """Find model by fuzzy matching against model names."""
-    search_name_lower = search_name.lower()
-    best_match = None
-    best_ratio = 0.0
-    
-    for record in _idx_by_id.values():
-        name_lower = record["name"].lower()
-        ratio = SequenceMatcher(None, search_name_lower, name_lower).ratio()
-        if ratio > best_ratio and ratio > 0.7:  # Threshold for fuzzy matching
-            best_ratio = ratio
-            best_match = record
-    
-    return best_match
 
 
 def resolve(model_id: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
@@ -210,13 +176,6 @@ def resolve(model_id: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
             if provider_model_key in _idx_by_provider_model:
                 notes.append(f"found via provider/model lookup (no suffix): '{provider_model_key}'")
                 return _idx_by_provider_model[provider_model_key], notes
-    
-    # Strategy 5: Fuzzy fallback - find by last segment name match
-    last_segment = model_id.split(":")[0].split("/")[-1]
-    fuzzy_match = _fuzzy_match_by_name(last_segment)
-    if fuzzy_match:
-        notes.append(f"fuzzy match by name segment '{last_segment}'")
-        return fuzzy_match, notes
     
     notes.append("no matches found with any strategy")
     return None, notes
@@ -280,14 +239,3 @@ def lookup_model(model_id: str) -> Optional[Dict[str, Any]]:
 def get_cached_catalog() -> Dict[str, Any]:
     """Return the full cached catalog data."""
     return _fetch_and_cache_catalog()
-
-
-# Legacy compatibility functions
-def get_model_info(model_id: str) -> Optional[Dict[str, Any]]:
-    """Legacy function - use lookup_model instead."""
-    return lookup_model(model_id)
-
-
-def cache_provider_logo(provider: str) -> Optional[str]:
-    """Legacy function - use get_logo_path instead."""
-    return get_logo_path(provider)

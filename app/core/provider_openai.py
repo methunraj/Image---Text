@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from urllib.parse import urlencode
+
 import httpx
+
+from app.core.config_schema import ReasoningConfig, RetryConfig, TimeoutConfig
+from app.core.model_registry import ModelDescriptor
 
 
 @lru_cache(maxsize=32)
@@ -117,70 +122,30 @@ def encode_image_to_b64(path: str) -> Tuple[str, str]:
     return encode_image_to_b64_cached(cache_key)
 
 
-def tiny_png_b64() -> str:
-    return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAukB9jQ9a6EAAAAASUVORK5CYII="
-
-
-class OpenAIProvider:
-    """Backward-compatible minimal client used by Settings probe."""
-
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None) -> None:
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
-        self.base_url = (base_url or os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")).rstrip("/")
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-    def chat(self, model: str, messages: List[Dict[str, Any]], temperature: float = 0.0, max_tokens: int | None = None, **extra: Any) -> Dict[str, Any]:
-        url = f"{self.base_url}/chat/completions"
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if extra:
-            payload.update(extra)
-
-        with httpx.Client(timeout=3600.0) as client:
-            resp = client.post(url, headers=self._headers(), json=payload)
-            resp.raise_for_status()
-            return resp.json()
-
-    @staticmethod
-    def image_message(role: str, text: str | None, image_urls: List[str]) -> Dict[str, Any]:
-        content: List[Dict[str, Any]] = []
-        if text:
-            content.append({"type": "text", "text": text})
-        for url in image_urls:
-            content.append({"type": "image_url", "image_url": {"url": url}})
-        return {"role": role, "content": content}
-
-
 @dataclass
 class OAIGateway:
-    """OpenAI-compatible gateway with robust fallbacks for vision + JSON.
-
-    - Adds OpenRouter header handling.
-    - Supports two vision encodings (image_url data URIs, and input_image objects) with fallback.
-    - Selects Tools or JSON mode based on detected capabilities and preferences.
-    - Retries on timeouts and 5xx.
-    """
+    """OpenAI-compatible gateway that works with registry-provided descriptors."""
 
     base_url: str
-    api_key: Optional[str]
-    headers: Optional[Dict[str, str]]
-    timeout: int
+    timeouts: TimeoutConfig
+    retry_config: RetryConfig
     prefer_json_mode: bool
     prefer_tools: bool
-    detected_caps: Optional[Dict[str, Any]] = None
+    default_temperature: float
+    default_top_p: Optional[float]
+    max_output_tokens: Optional[int]
+    max_temperature: float
+    headers: Optional[Dict[str, str]] = None
+    capabilities: Optional[Dict[str, Any]] = None
+    max_tokens_param_override: Optional[str] = None
     cached_max_tokens_param: Optional[str] = None
-    provider_id: Optional[int] = None
-    
+    allow_input_image_fallback: bool = True
+    provider_id: Optional[str] = None
+    auth_mode: str = "bearer_token"
+    auth_token: Optional[str] = None
+    auth_header_name: Optional[str] = None
+    auth_query_param: Optional[str] = None
+    reasoning: Optional[ReasoningConfig] = None
     def _is_local_model(self) -> bool:
         """Check if this is a local model endpoint."""
         if not self.base_url:
@@ -215,17 +180,29 @@ class OAIGateway:
         
         return any(indicator in url_lower for indicator in local_indicators)
 
+    def _is_google_openai(self) -> bool:
+        """Detect Google's OpenAI‑compatible endpoint (Generative Language)."""
+        base = (self.base_url or "").lower()
+        # Check for both /openai and /openai/ to handle URLs with or without trailing slash
+        return "generativelanguage.googleapis.com" in base and "/openai" in base
+
     def _headers(self) -> Dict[str, str]:
         h: Dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            h["Authorization"] = f"Bearer {self.api_key}"
-        # Merge user headers first, then ensure OpenRouter-required headers exist with sensible defaults.
         if self.headers:
             h.update(self.headers)
-        if "openrouter.ai" in (self.base_url or ""):
-            # OpenRouter requires HTTP-Referer and X-Title; keep user overrides if provided.
-            h.setdefault("HTTP-Referer", (self.headers or {}).get("HTTP-Referer", "http://localhost"))
-            h.setdefault("X-Title", (self.headers or {}).get("X-Title", "Images-JSON App"))
+
+        if self.auth_mode == "bearer_token" and self.auth_token:
+            header_name = self.auth_header_name or "Authorization"
+            value = self.auth_token
+            if header_name.lower() == "authorization" and not value.lower().startswith("bearer "):
+                value = f"Bearer {value}"
+            h[header_name] = value
+        elif self.auth_mode == "header" and self.auth_token and self.auth_header_name:
+            h[self.auth_header_name] = self.auth_token
+
+        # Note: OpenRouter requires HTTP-Referer and X-Title headers.
+        # These should be configured in Excel via extra_headers or passed in self.headers.
+        # No hardcoded defaults to enforce explicit configuration.
         return h
     
     def _mask_sensitive_data(self, data: Any) -> Any:
@@ -248,14 +225,18 @@ class OAIGateway:
         return data
 
     def _client(self) -> httpx.Client:
-        # Use 1 hour timeout to prevent premature timeouts with slow models
-        t = httpx.Timeout(3600, connect=3600, read=3600, write=3600)
-        return httpx.Client(timeout=t)
+        timeout = httpx.Timeout(
+            self.timeouts.total_s,
+            connect=self.timeouts.connect_s,
+            read=self.timeouts.read_s,
+            write=self.timeouts.read_s,
+        )
+        return httpx.Client(timeout=timeout)
 
-    def _post_with_retries(self, url: str, json_payload: Dict[str, Any], max_retries: int = 3) -> httpx.Response:
+    def _post_with_retries(self, url: str, json_payload: Dict[str, Any], max_retries: Optional[int] = None) -> httpx.Response:
         # Only show verbose debug on first attempt or if VERBOSE_DEBUG is set
         verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-        
+
         if verbose:
             print(f"Debug [API Request]: Making request to {url}")
             print(f"Debug [API Request]: Model: {json_payload.get('model', 'N/A')}")
@@ -269,24 +250,33 @@ class OAIGateway:
             # Don't show full payload to avoid leaking prompts with potential sensitive data
             payload_keys = list(json_payload.keys())
             print(f"Debug [API Request]: Payload keys: {payload_keys}")
-        
-        delay = 0.5
+
+        retries = max_retries if max_retries is not None else max(self.retry_config.max_retries, 0)
+        retries = max(1, retries)
+        delay = self.retry_config.backoff_s or 0.5
         last_exc: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
+        retryable = set(self.retry_config.retry_on or [429, 500, 502, 503, 504])
+
+        for attempt in range(1, retries + 1):
             # Only show attempt info if it's a retry (attempt > 1) or there's an error
             try:
                 with self._client() as client:
-                    resp = client.post(url, headers=self._headers(), json=json_payload)
-                    
+                    request_url = url
+                    if self.auth_mode == "query" and self.auth_token and self.auth_query_param:
+                        query = urlencode({self.auth_query_param: self.auth_token})
+                        request_url = f"{url}{'&' if '?' in url else '?'}{query}"
+
+                    resp = client.post(request_url, headers=self._headers(), json=json_payload)
+
                     # Check for retryable errors
-                    if resp.status_code in (429, 500, 502, 503, 504):
+                    if resp.status_code in retryable:
                         error_body = resp.text if hasattr(resp, 'text') else 'No body'
-                        print(f"⚠️ Retryable error {resp.status_code} on attempt {attempt}/{max_retries}")
+                        print(f"⚠️ Retryable error {resp.status_code} on attempt {attempt}/{retries}")
                         if verbose:
                             print(f"   Error body: {error_body[:200]}")
                         last_exc = httpx.HTTPStatusError("server error", request=resp.request, response=resp)
                         raise last_exc
-                    
+
                     resp.raise_for_status()
                     
                     # Success - only show if it was a retry
@@ -296,27 +286,27 @@ class OAIGateway:
                         print(f"Debug [API Request]: Response status: {resp.status_code}")
                     
                     return resp
-                    
+
             except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
                 # Always show errors
                 if isinstance(e, httpx.TimeoutException):
-                    print(f"⏱️ Timeout on attempt {attempt}/{max_retries}")
-                elif not (hasattr(e, 'response') and e.response.status_code in (429, 500, 502, 503, 504)):
+                    print(f"⏱️ Timeout on attempt {attempt}/{retries}")
+                elif not (hasattr(e, 'response') and e.response.status_code in retryable):
                     # Non-retryable HTTP error
                     print(f"❌ HTTP Error on attempt {attempt}: {e}")
                     if verbose and hasattr(e, 'response'):
                         print(f"   Response: {e.response.text[:200] if hasattr(e.response, 'text') else 'No body'}")
-                
+
                 last_exc = e
-                if attempt >= max_retries:
+                if attempt >= retries:
                     break
-                    
+
                 print(f"   Retrying in {delay}s...")
                 time.sleep(delay)
                 delay = min(delay * 2, 4.0)
-        
+
         assert last_exc is not None
-        print(f"❌ All {max_retries} attempts failed")
+        print(f"❌ All {retries} attempts failed")
         raise last_exc
 
     @staticmethod
@@ -341,212 +331,64 @@ class OAIGateway:
         return {"role": "user", "content": parts}
 
     def _extract_text_and_tool(self, data: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Extract text and tool call from OpenAI-compatible response.
+        
+        Supports standard OpenAI format: choices[0].message.content + tool_calls
+        """
         text: Optional[str] = None
         tool_call: Optional[Dict[str, Any]] = None
         
-        print(f"Debug [_extract_text_and_tool]: Starting extraction with data keys: {list(data.keys())}")
-        
         try:
-            # Handle different response formats
+            # Standard OpenAI format: choices[0].message
             choices = data.get("choices", [])
-            print(f"Debug [_extract_text_and_tool]: Choices: {type(choices)}, length: {len(choices) if isinstance(choices, list) else 'N/A'}")
-            
             if not choices:
-                print(f"Debug [_extract_text_and_tool]: No choices found, checking top-level keys")
-                # Some providers might return completion directly
-                for key in ["completion", "text", "content", "output", "result"]:
-                    if key in data:
-                        text = data[key]
-                        print(f"Debug [_extract_text_and_tool]: Found text in top-level key '{key}': {repr(text)[:100]}")
-                        return text, tool_call
-                print(f"Debug [_extract_text_and_tool]: No text found in top-level keys")
-                return text, tool_call
+                # Fallback: check top-level keys for non-standard providers
+                for key in ["text", "content", "completion"]:
+                    if key in data and isinstance(data[key], str):
+                        return data[key], None
+                return None, None
             
             choice = choices[0]
-            print(f"Debug [_extract_text_and_tool]: First choice type: {type(choice)}")
-            print(f"Debug [_extract_text_and_tool]: First choice keys: {list(choice.keys()) if isinstance(choice, dict) else 'Not a dict'}")
+            if not isinstance(choice, dict):
+                return None, None
             
-            # Check all possible locations for text in the choice
-            if isinstance(choice, dict):
-                # Direct text in choice
-                if "text" in choice:
-                    text = choice["text"]
-                    print(f"Debug [_extract_text_and_tool]: Found text directly in choice: {repr(text)[:100]}")
+            # Extract from message
+            msg = choice.get("message", {})
+            if isinstance(msg, dict):
+                # Text content
+                content = msg.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    # Content as list of parts (OpenAI format)
+                    texts = [
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    ]
+                    text = "\n".join(texts) if texts else None
                 
-                # Message-based extraction
-                msg = choice.get("message") or {}
-                print(f"Debug [_extract_text_and_tool]: Message type: {type(msg)}")
-                print(f"Debug [_extract_text_and_tool]: Message keys: {list(msg.keys()) if isinstance(msg, dict) else 'Not a dict'}")
+                # Tool calls
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    func = tool_calls[0].get("function", {})
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            tool_call = json.loads(args)
+                        except:
+                            pass
+                    elif isinstance(args, dict):
+                        tool_call = args
+            
+            # Fallback: check for text directly in choice
+            if text is None and "text" in choice:
+                text = choice["text"]
                 
-                if isinstance(msg, dict):
-                    # Text extraction from message content
-                    content = msg.get("content")
-                    print(f"Debug [_extract_text_and_tool]: Content type: {type(content)}")
-                    print(f"Debug [_extract_text_and_tool]: Content value: {repr(content)}")
-                    
-                    if isinstance(content, str):
-                        text = content
-                        print(f"Debug [_extract_text_and_tool]: Extracted string content: {repr(text)[:100]}")
-                    elif isinstance(content, list):
-                        print(f"Debug [_extract_text_and_tool]: Content is list with {len(content)} items")
-                        # OpenAI may return content as list of parts
-                        texts = []
-                        for i, part in enumerate(content):
-                            print(f"Debug [_extract_text_and_tool]: Part {i}: {type(part)}, keys: {list(part.keys()) if isinstance(part, dict) else 'Not a dict'}")
-                            if isinstance(part, dict):
-                                part_type = part.get("type")
-                                part_text = part.get("text", "")
-                                print(f"Debug [_extract_text_and_tool]: Part {i} type: {part_type}, text: {repr(part_text)[:50]}")
-                                if part_type == "text" and part_text:
-                                    texts.append(part_text)
-                        text = "\n".join(texts) if texts else None
-                        print(f"Debug [_extract_text_and_tool]: Assembled text from list parts: {repr(text)[:100] if text else 'None'}")
-                    elif content is None:
-                        print(f"Debug [_extract_text_and_tool]: Content is None")
-                    else:
-                        print(f"Debug [_extract_text_and_tool]: Content is unexpected type: {type(content)}")
-                    
-                    # Tools extraction
-                    tcs = msg.get("tool_calls")
-                    print(f"Debug [_extract_text_and_tool]: Tool calls: {type(tcs)}, value: {tcs}")
-                    if isinstance(tcs, list) and tcs:
-                        print(f"Debug [_extract_text_and_tool]: Processing {len(tcs)} tool calls")
-                        fun = tcs[0].get("function", {})
-                        args = fun.get("arguments")
-                        print(f"Debug [_extract_text_and_tool]: Tool args type: {type(args)}, value: {args}")
-                        if isinstance(args, str):
-                            try:
-                                import json as _json
-                                tool_call = _json.loads(args)
-                                print(f"Debug [_extract_text_and_tool]: Parsed tool call from string: {tool_call}")
-                            except Exception as parse_err:
-                                print(f"Debug [_extract_text_and_tool]: Failed to parse tool args: {parse_err}")
-                                tool_call = None
-                        elif isinstance(args, dict):
-                            tool_call = args
-                            print(f"Debug [_extract_text_and_tool]: Using tool args as dict: {tool_call}")
-                
-                # Additional fallback checks
-                if text is None:
-                    print(f"Debug [_extract_text_and_tool]: No text found yet, checking additional choice keys")
-                    for key in ["delta", "completion", "output"]:
-                        if key in choice:
-                            fallback_content = choice[key]
-                            print(f"Debug [_extract_text_and_tool]: Found fallback key '{key}': {type(fallback_content)}")
-                            if isinstance(fallback_content, dict) and "content" in fallback_content:
-                                text = fallback_content["content"]
-                                print(f"Debug [_extract_text_and_tool]: Extracted text from {key}.content: {repr(text)[:100]}")
-                                break
-                            elif isinstance(fallback_content, str):
-                                text = fallback_content
-                                print(f"Debug [_extract_text_and_tool]: Used {key} directly as text: {repr(text)[:100]}")
-                                break
-            
-            print(f"Debug [_extract_text_and_tool]: Final extraction results:")
-            print(f"  - Text: {repr(text) if text else 'None'}")
-            print(f"  - Text length: {len(text) if text else 0} characters")
-            # Estimate token count (rough approximation: ~4 chars per token)
-            if text:
-                estimated_tokens = len(text) // 4
-                print(f"  - Estimated tokens: ~{estimated_tokens} tokens")
-                if estimated_tokens < 250:
-                    print(f"  - WARNING: Output appears truncated at ~{estimated_tokens} tokens!")
-            print(f"  - Tool call: {tool_call}")
-            
-        except Exception as e:
-            print(f"Debug [_extract_text_and_tool]: Exception during extraction: {e}")
-            import traceback
-            traceback.print_exc()
-            
-        # Final OpenRouter-specific fallback
-        if text is None and "openrouter.ai" in getattr(self, 'base_url', ''):
-            print(f"Debug [_extract_text_and_tool]: Applying OpenRouter-specific extraction fallbacks")
-            text = self._openrouter_extract_text(data)
-            if text:
-                print(f"Debug [_extract_text_and_tool]: OpenRouter fallback extracted: {repr(text)[:100]}")
-            
+        except Exception:
+            pass
+        
         return text, tool_call
-
-    def _openrouter_extract_text(self, data: Dict[str, Any]) -> Optional[str]:
-        """OpenRouter-specific text extraction fallbacks"""
-        print(f"Debug [_openrouter_extract_text]: Checking OpenRouter-specific patterns")
-        
-        # Check for non-standard response structures that OpenRouter might use
-        patterns_to_check = [
-            # Direct response patterns
-            ("response", "text"),
-            ("response", "content"),
-            ("data", "response"),
-            ("output", "text"),
-            ("result", "content"),
-            
-            # Nested patterns
-            ("choices", 0, "text"),
-            ("choices", 0, "content"),
-            ("choices", 0, "message", "text"),
-            ("choices", 0, "delta", "text"),
-            ("data", "choices", 0, "message", "content"),
-            ("data", "choices", 0, "text"),
-            
-            # Generation patterns (some APIs use these)
-            ("generations", 0, "text"),
-            ("completions", 0, "text"),
-        ]
-        
-        for pattern in patterns_to_check:
-            try:
-                current = data
-                for key in pattern:
-                    if isinstance(key, int):
-                        if isinstance(current, list) and len(current) > key:
-                            current = current[key]
-                        else:
-                            break
-                    elif isinstance(current, dict) and key in current:
-                        current = current[key]
-                    else:
-                        break
-                else:
-                    # We successfully navigated the pattern
-                    if isinstance(current, str) and current.strip():
-                        print(f"Debug [_openrouter_extract_text]: Found text via pattern {pattern}: {repr(current)[:50]}")
-                        return current
-            except Exception as e:
-                print(f"Debug [_openrouter_extract_text]: Error checking pattern {pattern}: {e}")
-                continue
-        
-        # Check for any string values in the response that might be the content
-        def find_likely_content(obj, path=""):
-            if isinstance(obj, str) and len(obj.strip()) > 10:  # Likely content if > 10 chars
-                if not any(keyword in obj.lower() for keyword in ['error', 'invalid', 'failed', 'exception']):
-                    print(f"Debug [_openrouter_extract_text]: Found potential content at {path}: {repr(obj)[:50]}")
-                    return obj
-            elif isinstance(obj, dict):
-                for key, value in obj.items():
-                    if key in ['content', 'text', 'response', 'output', 'result', 'completion']:
-                        result = find_likely_content(value, f"{path}.{key}")
-                        if result:
-                            return result
-                # Check other keys too
-                for key, value in obj.items():
-                    if key not in ['id', 'object', 'created', 'model', 'usage', 'error', 'status']:
-                        result = find_likely_content(value, f"{path}.{key}")
-                        if result:
-                            return result
-            elif isinstance(obj, list) and obj:
-                for i, item in enumerate(obj[:3]):  # Check first 3 items only
-                    result = find_likely_content(item, f"{path}[{i}]")
-                    if result:
-                        return result
-            return None
-        
-        potential_content = find_likely_content(data)
-        if potential_content:
-            print(f"Debug [_openrouter_extract_text]: Found potential content: {repr(potential_content)[:100]}")
-            return potential_content
-            
-        print(f"Debug [_openrouter_extract_text]: No content found via OpenRouter fallbacks")
-        return None
 
     def chat_vision(
         self,
@@ -569,10 +411,91 @@ class OAIGateway:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
 
         # Unified params handling
-        effective_params = gen_params or params or {}
-        # Keep only universal params here; handle max token key via compatibility layer below
-        base_payload: Dict[str, Any] = {k: v for k, v in effective_params.items() if k in {"temperature", "top_p", "seed"}}
+        effective_params = dict(gen_params or params or {})
+
+        # Temperature defaults and clamping
+        temp = effective_params.get("temperature", self.default_temperature)
+        try:
+            temp_val = float(temp)
+        except (TypeError, ValueError):
+            temp_val = self.default_temperature
+        temp_val = max(0.0, min(temp_val, self.max_temperature))
+        effective_params["temperature"] = temp_val
+
+        # Top-p defaults and clamping
+        if "top_p" not in effective_params and self.default_top_p is not None:
+            effective_params["top_p"] = self.default_top_p
+        if "top_p" in effective_params:
+            try:
+                top_p_val = float(effective_params["top_p"])
+            except (TypeError, ValueError):
+                top_p_val = 1.0
+            top_p_val = max(0.0, min(top_p_val, 1.0))
+            effective_params["top_p"] = top_p_val
+
+        # Max tokens defaults and clamping
         max_tokens_val = effective_params.get("max_tokens")
+        limit = self.max_output_tokens if self.max_output_tokens not in (None, 0) else None
+        if max_tokens_val is None and limit is not None:
+            effective_params["max_tokens"] = limit
+            max_tokens_val = limit
+        elif max_tokens_val is not None:
+            try:
+                max_tokens_val = int(max_tokens_val)
+            except (TypeError, ValueError):
+                max_tokens_val = limit
+            if limit is not None and max_tokens_val is not None:
+                max_tokens_val = min(max_tokens_val, limit)
+            if max_tokens_val is not None:
+                effective_params["max_tokens"] = max_tokens_val
+
+        extra_body_payload: Dict[str, Any] = {}
+        raw_extra_body = effective_params.pop("extra_body", None)
+        if isinstance(raw_extra_body, dict):
+            extra_body_payload = dict(raw_extra_body)
+
+        reasoning_payload: Optional[Dict[str, Any]] = None
+        if self.reasoning and self.reasoning.provider and self.reasoning.provider != "none":
+            provider_key = self.reasoning.provider
+
+            # Respect user-provided overrides when allowed
+            user_reasoning_effort = effective_params.get("reasoning_effort")
+
+            if provider_key == "openai":
+                if (
+                    "reasoning" not in effective_params
+                    and not reasoning_payload
+                    and self.reasoning.effort_default
+                    and not user_reasoning_effort
+                ):
+                    reasoning_payload = {"effort": self.reasoning.effort_default}
+            elif provider_key == "google":
+                if self.reasoning.effort_default and not user_reasoning_effort:
+                    effective_params.setdefault("reasoning_effort", self.reasoning.effort_default)
+                google_section = extra_body_payload.get("google")
+                if isinstance(google_section, dict):
+                    google_section.pop("thinking_config", None)
+            # allow_override False -> enforce defaults
+            if self.reasoning.allow_override is False:
+                if provider_key == "openai" and self.reasoning.effort_default:
+                    reasoning_payload = {"effort": self.reasoning.effort_default}
+                    effective_params.pop("reasoning_effort", None)
+                if provider_key == "google":
+                    if self.reasoning.effort_default:
+                        effective_params["reasoning_effort"] = self.reasoning.effort_default
+                    google_section = extra_body_payload.get("google")
+                    if isinstance(google_section, dict):
+                        google_section.pop("thinking_config", None)
+
+        # Keep only universal params here; handle max token key via compatibility layer below
+        base_payload: Dict[str, Any] = {
+            k: v for k, v in effective_params.items() if k in {"temperature", "top_p", "seed"}
+        }
+        additional_payload: Dict[str, Any] = {
+            k: v
+            for k, v in effective_params.items()
+            if k not in {"temperature", "top_p", "seed", "max_tokens"}
+        }
 
         # Messages assembly
         payload_messages: List[Dict[str, Any]] = []
@@ -594,18 +517,16 @@ class OAIGateway:
         # Build user message later per encoding variant
 
         # Decide modes - be more conservative with local models
-        caps = self.detected_caps or {}
+        caps = self.capabilities or {}
         is_local = self._is_local_model()
-        
-        # Local models often don't support tools or JSON mode properly
-        if is_local and self.detected_caps is None:
-            # For unprobed local models, assume no advanced features
+
+        if is_local and not caps:
             tools_ok = False
             json_ok = False
         else:
-            tools_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("tools"))
-            json_ok = True if (self.detected_caps is None and not is_local) else bool(caps.get("json_mode"))
-        
+            tools_ok = bool(caps.get("tools"))
+            json_ok = bool(caps.get("json_mode")) or bool(caps.get("structured_output"))
+
         use_tools = bool(self.prefer_tools and tools_ok and schema)
         use_json_mode = bool((not use_tools) and self.prefer_json_mode and json_ok)
 
@@ -665,7 +586,9 @@ class OAIGateway:
                 # Anthropic Claude
                 "max_tokens_to_sample", "max_tokens",
                 # Google (Gemini, PaLM)
-                "maxOutputTokens", "max_output_tokens", "candidateCount",
+                # When using OpenAI compatibility, prefer OpenAI-style params
+                "max_tokens", "max_completion_tokens",  # Try OpenAI params first
+                "max_output_tokens", "maxOutputTokens",  # Then Google native params
                 # Cohere
                 "max_tokens", "max_output_tokens",
                 # Azure OpenAI
@@ -690,14 +613,23 @@ class OAIGateway:
         def _send_with_max_variants(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
             # Get verbose flag for debug output
             verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
-            
+
             # Use persisted cached parameter if available
+            if self.max_tokens_param_override and not self.cached_max_tokens_param:
+                self.cached_max_tokens_param = self.max_tokens_param_override
             cached_param = self.cached_max_tokens_param
-            
+
+            # Provider-specific correction: Google's OpenAI-compatible API expects
+            # OpenAI-style params when in compatibility mode. Clear native Google params.
+            if self._is_google_openai() and cached_param in ("maxOutputTokens", "max_output_tokens"):
+                print("⚙️ Google OpenAI-compatible endpoint detected; clearing native parameter '" + str(cached_param) + "' to probe OpenAI-style params.")
+                cached_param = None
+                self.cached_max_tokens_param = None
+
             tried: List[str] = []
             last_exc: Optional[httpx.HTTPStatusError] = None
             failed_with_none = False
-            
+
             # Build ordered candidates
             if cached_param and max_tokens_val is not None:
                 # Use cached successful parameter first, then try None if it fails
@@ -737,8 +669,13 @@ class OAIGateway:
                     if verbose:
                         print(f"   Testing without max_tokens parameter")
                 
+                payload.update(additional_payload)
                 payload = attach_modes(payload)
-                
+                if reasoning_payload and "reasoning" not in payload:
+                    payload["reasoning"] = reasoning_payload
+                if extra_body_payload and "extra_body" not in payload:
+                    payload["extra_body"] = extra_body_payload
+
                 try:
                     # Use reduced retries for parameter testing
                     test_retries = 1 if len(tried) > 1 else 2
@@ -748,15 +685,6 @@ class OAIGateway:
                     if key and max_tokens_val is not None and not cached_param:
                         self.cached_max_tokens_param = key
                         print(f"✅ Parameter '{key}' works - caching for future requests")
-                        
-                        # Persist to database if provider_id is available
-                        if self.provider_id:
-                            try:
-                                from app.core import storage
-                                storage.update_provider(self.provider_id, cached_max_tokens_param=key)
-                            except Exception as e:
-                                if verbose:
-                                    print(f"Warning: Could not persist cached parameter: {e}")
                     elif key is None and max_tokens_val is not None:
                         print(f"ℹ️ Model works without max_tokens parameter")
                     
@@ -776,10 +704,17 @@ class OAIGateway:
                     param_error_keywords = [
                         "unsupported parameter", "unknown parameter", "is not supported",
                         "invalid_request_error", "unrecognized parameter", "invalid parameter",
-                        "not a valid parameter", "unexpected parameter", "extra parameter"
+                        "not a valid parameter", "unexpected parameter", "extra parameter",
+                        # Google's generic error messages
+                        "invalid argument", "invalid value", "bad request",
+                        "request contains an invalid argument"
                     ]
                     
                     is_param_error = status in (400, 422) and any(kw in low for kw in param_error_keywords)
+                    # Treat Google OpenAI 400s with any max_tokens variant as parameter errors even if message is generic
+                    if status in (400, 422) and self._is_google_openai() and key:
+                        # Google often returns generic errors for parameter issues
+                        is_param_error = True
                     
                     if is_param_error and key:
                         if cached_param == key:
@@ -787,14 +722,6 @@ class OAIGateway:
                             print(f"⚠️ Cached parameter '{key}' no longer works, clearing cache")
                             self.cached_max_tokens_param = None
                             cached_param = None
-                            
-                            # Clear from database if provider_id is available
-                            if self.provider_id:
-                                try:
-                                    from app.core import storage
-                                    storage.update_provider(self.provider_id, cached_max_tokens_param=None)
-                                except Exception:
-                                    pass
                         # Don't print for every failed attempt
                         if len(tried) <= 3 or verbose:
                             print(f"   ❌ Parameter '{key}' not supported")
@@ -840,6 +767,11 @@ class OAIGateway:
             # First, capture the raw response body before JSON parsing
             raw_body = resp.text
             verbose = os.getenv("VERBOSE_DEBUG", "").lower() in ("1", "true", "yes")
+            if not verbose:
+                def _noop(*args, **kwargs):
+                    return None
+                # Shadow print locally for non-verbose mode
+                print = _noop  # type: ignore
             
             if verbose:
                 print(f"Debug [Response]: RAW HTTP Response Body:")
@@ -958,21 +890,49 @@ class OAIGateway:
             except Exception:
                 body_text = ""
             # Check if we should fallback to EncB
-            if status in (400, 415, 422):
-                bt = (body_text or "").lower()
-                # Retry once with EncB (input_image) and re-run token key variants
-                if ("image_url" in bt) or ("data:" in bt) or True:
-                    enc_used = "EncB"
-                    messages_b = payload_messages + [self._build_user_with_images_enc_b(user_text, image_paths)]
-                    try:
-                        return _send_with_max_variants(messages_b)
-                    except httpx.HTTPStatusError as e2:
-                        status2 = e2.response.status_code if hasattr(e2, "response") else 500
-                        body2 = e2.response.text if hasattr(e2, "response") and hasattr(e2.response, "text") else ""
-                        return error_out(status2, body2, f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
-                    except httpx.TimeoutException:
-                        return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+            if status in (400, 415, 422) and self.allow_input_image_fallback:
+                # Always retry with EncB on these status codes to re-probe parameters
+                # This helps with both image encoding issues AND parameter compatibility
+                enc_used = "EncB"
+                messages_b = payload_messages + [self._build_user_with_images_enc_b(user_text, image_paths)]
+                try:
+                    return _send_with_max_variants(messages_b)
+                except httpx.HTTPStatusError as e2:
+                    status2 = e2.response.status_code if hasattr(e2, "response") else 500
+                    body2 = e2.response.text if hasattr(e2, "response") and hasattr(e2.response, "text") else ""
+                    return error_out(status2, body2, f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+                except httpx.TimeoutException:
+                    return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
             # Not a fallback case; surface error
             return error_out(status, body_text or "", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
         except httpx.TimeoutException:
             return error_out(408, "timeout", f"{enc_used} with {'tools' if use_tools else ('json' if use_json_mode else 'prompt')}")
+
+
+def gateway_from_descriptor(descriptor: ModelDescriptor) -> OAIGateway:
+    capabilities = descriptor.capabilities.model_dump()
+    compatibility = descriptor.compatibility
+    max_tokens_param = compatibility.max_tokens_param
+    allow_input_image = compatibility.allow_input_image_fallback
+    return OAIGateway(
+        base_url=descriptor.base_url,
+        timeouts=descriptor.timeouts,
+        retry_config=descriptor.retry,
+        prefer_json_mode=descriptor.force_json_mode,
+        prefer_tools=descriptor.prefer_tools,
+        default_temperature=descriptor.default_temperature,
+        default_top_p=descriptor.default_top_p,
+        max_output_tokens=descriptor.max_output_tokens,
+        max_temperature=descriptor.max_temperature,
+        headers=descriptor.extra_headers(),
+        capabilities=capabilities,
+        max_tokens_param_override=max_tokens_param,
+        cached_max_tokens_param=max_tokens_param,
+        allow_input_image_fallback=allow_input_image,
+        provider_id=descriptor.provider_id,
+        auth_mode=descriptor.provider_auth.auth_mode,
+        auth_token=descriptor.provider_auth.auth_token,
+        auth_header_name=descriptor.provider_auth.auth_header_name,
+        auth_query_param=descriptor.provider_auth.auth_query_param,
+        reasoning=descriptor.reasoning,
+    )

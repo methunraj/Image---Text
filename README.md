@@ -4,8 +4,9 @@ A lightweight, modular Streamlit app for turning images into structured JSON usi
 
 ## Features
 
-- Clean 4‑page flow (Settings, Upload, Templates, Run & Test).
-- Provider profiles with models.dev integration, capability probe, defaults, and secure key storage (session or Fernet‑encrypted).
+- Clean 2‑page flow (Settings, Upload & Process).
+- Server-side model registry maintained in `config/models.xlsx` (profiles, capabilities, per-million pricing, limits).
+- Optional encrypted secrets managed via `scripts/secretset.py` + Fernet/`APP_KMS_KEY`.
 - Template management with schema editor, few‑shots, import/export (YAML/JSON), and live preview rendering.
 - Upload and manage images with per‑image tags (doc_type, locale) and selection.
 - Run pipeline with robust fallbacks (tools → JSON mode → prompt) and strict JSON validation + auto‑repair.
@@ -24,11 +25,14 @@ A lightweight, modular Streamlit app for turning images into structured JSON usi
 
   ```bash
   cp .env.example .env
-  # Edit .env with your API base/key/model
-  # (Optional) generate APP_KMS_KEY for encrypted key storage
+  # Edit .env to set APP_PROFILE (dev/prod) and optional overrides
+  # (Optional) generate APP_KMS_KEY or let scripts/secretset.py create data/kms.key
   ```
 
-- (Optional) add `.streamlit/secrets.toml` for deployment secrets.
+- Populate provider API keys referenced in `config/models.xlsx` (`OPENAI_API_KEY`, `GOOGLE_API_KEY`, `XAI_API_KEY`, `DASHSCOPE_API_KEY`). Providers without credentials are skipped automatically; the registry falls back to the first available provider/model.
+
+- Edit `config/models.xlsx` to manage providers/models (per-million pricing, capabilities, reasoning defaults). Use `APP_PROFILE` to switch profiles. Set `compat_max_tokens_param` when a provider expects a non-standard max-token field (e.g., `maxOutputTokens` for Gemini), and toggle `compat_allow_input_image` to `N` for providers that reject the OpenAI `input_image` fallback.
+- (Optional) store encrypted secrets: `python scripts/secretset.py OPENAI_API_KEY sk-...`
 
 - Run the app:
 
@@ -41,31 +45,17 @@ On first run, `data/app.db` (SQLite) is created.
 ## App Flow
 
 - Settings (⚙):
-  - Manage provider profiles: base URL, API key, model ID, headers, timeout.
-  - Security: store API key in session or encrypted in DB (Fernet via `APP_KMS_KEY`).
-  - models.dev: lookup by model ID, show provider info and pricing, apply caps/pricing and logo.
-  - Capability probe: tests JSON mode, vision, and tools; badges show detected capabilities.
-  - Defaults: temperature, top_p, max output tokens, and preferences for JSON mode and tools.
+  - Configure providers/models (base URL, headers, timeouts) and manage API keys (session or encrypted).
+  - Browse/select models from the catalog; probe capabilities; set an active profile in the local DB.
 
-- Upload (📤):
-  - Upload multiple images (PNG/JPG), persisted to `data/uploads/`.
-  - See thumbnails, select subset, and add per‑image tags (`doc_type`, `locale`).
-  - Guard banner if active model lacks image modality.
-
-- Templates (🧩):
-  - Create/clone/delete templates; set system and user prompts.
-  - Schema editor with validation; attach up to 3 few‑shot examples.
-  - Import/export YAML/JSON; live preview renders final message array.
-
-- Run & Test (🚀):
-  - Choose a template and images, review the request plan from capabilities + defaults.
-  - Run extraction per image using robust fallbacks; validate JSON with auto‑repair.
-  - Show raw text, validated JSON, repair attempts, usage (if present), cost, and latency.
-  - Save runs; define a test suite with assertions or golden JSON; run across profiles and export results.
+- Upload & Process (📤):
+  - Upload or select folders of images, tag images, select a template, and run extraction.
+  - View raw or structured output; export JSON/Markdown/XLSX/DOCX; usage and cost if available.
+  - Upload PDF(s): convert pages to images into a chosen folder (DPI/format/page range), update a folder checkpoint, and queue pending pages for processing.
 
 ## Pricing
 
-- Usage‑based cost is computed from the provider’s `usage` object (prompt/completion tokens, optional cache read/write) and the active profile’s models.dev `cost` block. If usage is missing, cost shows as N/A.
+- Usage‑based cost is computed from the provider `usage` payload (prompt/completion/cache tokens) using the active model’s per-1K prices (auto-converted from the Excel per-million rates). If usage is missing, cost shows as N/A.
 
 ## Limitations
 
@@ -75,9 +65,10 @@ On first run, `data/app.db` (SQLite) is created.
 ## Structure
 
 - `app/main.py` – App entry and sidebar chip.
-- `app/pages/` – 4 pages (Settings, Upload, Templates, Run & Test).
+- `app/pages/` – 2 pages (Settings, Upload & Process).
 - `app/core/` – Storage, provider gateway, templating, JSON enforcement, cost, UI.
-- `app/assets/` – Static assets, including sample templates.
+- `config/models.xlsx` – Excel workbook defining profiles, providers, models, pricing, reasoning defaults.
+- `app/assets/` – Static assets, including sample templates. YAML files under `app/assets/templates/` are auto-imported on startup and updated when templates are saved in the Settings page.
 - `data/` and `export/` – Runtime dirs (gitignored).
 
 ## Sample Template & Images
