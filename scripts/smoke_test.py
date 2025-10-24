@@ -22,7 +22,12 @@ def _add_sys_path() -> None:
 def _load_env() -> None:
     try:
         from dotenv import load_dotenv  # type: ignore
-        load_dotenv(_project_root() / ".env")
+        root = _project_root()
+        cfg = root / "config" / ".env"
+        if cfg.exists():
+            load_dotenv(cfg)
+        else:
+            load_dotenv(root / ".env")
     except Exception:
         pass
 
@@ -152,4 +157,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -98,7 +98,17 @@ def _ensure_runtime_dirs() -> None:
 
 
 def main() -> None:
-    load_dotenv()
+    # Load environment from config/.env first (preferred), then fallback to project .env
+    config_env = _ROOT / "config" / ".env"
+    try:
+        loaded = False
+        if config_env.exists():
+            loaded = load_dotenv(config_env, override=False)
+        if not loaded:
+            load_dotenv(_ROOT / ".env", override=False)
+    except Exception:
+        # Do not crash app if dotenv loading fails
+        pass
     registry_error: str | None = None
     registry = None
     try:

@@ -2200,7 +2200,15 @@ def _project_management() -> None:
 
 # Override old run() with registry-driven workflow
 def run() -> None:  # type: ignore[no-redef]
-    load_dotenv(override=False)
+    # Load env from config/.env (preferred), fallback to project .env
+    try:
+        cfg_env = _ROOT / "config" / ".env"
+        if cfg_env.exists():
+            load_dotenv(cfg_env, override=False)
+        else:
+            load_dotenv(_ROOT / ".env", override=False)
+    except Exception:
+        pass
     st.title("Settings")
     storage.init_db()
 

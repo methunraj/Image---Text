@@ -24,8 +24,8 @@ A lightweight, modular Streamlit app for turning images into structured JSON usi
 - Configure environment (optional):
 
   ```bash
-  cp .env.example .env
-  # Edit .env to set APP_PROFILE (dev/prod) and optional overrides
+  mkdir -p config && cp .env.example config/.env
+  # Edit config/.env to set APP_PROFILE (dev/prod) and optional overrides
   # (Optional) generate APP_KMS_KEY or let scripts/secretset.py create data/kms.key
   ```
 
