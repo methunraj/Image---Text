@@ -889,16 +889,18 @@ def run() -> None:
         )
 
     # Format selection when per-file save is enabled
-    save_formats = {'json': True, 'md': True, 'docx': True}  # Default: all formats
+    save_formats = {'json': True, 'md': True, 'docx': True, 'xlsx': True}  # Default: all formats
     if per_file_mode:
         st.markdown("**Select formats to save:**")
-        fcol1, fcol2, fcol3, _ = st.columns([1, 1, 1, 3])
+        fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1, 1])
         with fcol1:
             save_formats['json'] = st.checkbox("JSON", value=True, key='save_json')
         with fcol2:
             save_formats['md'] = st.checkbox("Markdown", value=True, key='save_md')
         with fcol3:
             save_formats['docx'] = st.checkbox("Word", value=True, key='save_docx')
+        with fcol4:
+            save_formats['xlsx'] = st.checkbox("Excel", value=True, key='save_xlsx')
 
         # Ensure at least one format is selected
         if not any(save_formats.values()):
@@ -963,7 +965,7 @@ def run() -> None:
         from scripts.export_records import to_docx_bytes, to_docx_from_text_bytes
         total = len(selected)
         progress = st.progress(0.0, text=f"Processing 0/{total}")
-        saved_counts = {"json": 0, "md": 0, "docx": 0}
+        saved_counts = {"json": 0, "md": 0, "docx": 0, "xlsx": 0}
         errors: List[str] = []
         st.session_state['per_file_mode_active'] = True
         # Prepare checkpoint (works for both folder-based and uploaded files)
@@ -1015,6 +1017,15 @@ def run() -> None:
         for idx, img_path in enumerate(selected, start=1):
             try:
                 per_file_gateway = gateway_from_descriptor(descriptor)
+                # Project-specific API key override
+                try:
+                    active_project = storage.get_active_project()
+                    if active_project:
+                        proj_key = storage.get_decrypted_project_api_key(active_project.id, descriptor.provider_id)
+                        if proj_key:
+                            per_file_gateway.auth_token = proj_key
+                except Exception:
+                    pass
                 if unstructured:
                     per_file_gateway.prefer_json_mode = False
                     per_file_gateway.prefer_tools = False
@@ -1068,6 +1079,13 @@ def run() -> None:
                                 (output_dir / f"{base_name}.json").write_bytes(json_bytes)
                                 saved_files['json'] = str(output_dir / f"{base_name}.json")
                                 saved_counts['json'] += 1
+                            if save_formats.get('xlsx', False):
+                                recs = ensure_records({"raw_text": text})
+                                cols = all_columns(recs)
+                                xlsx_bytes = to_xlsx_bytes(recs, cols)
+                                (output_dir / f"{base_name}.xlsx").write_bytes(xlsx_bytes)
+                                saved_files['xlsx'] = str(output_dir / f"{base_name}.xlsx")
+                                saved_counts['xlsx'] += 1
                         else:
                             # UPLOAD MODE: Prepare for download
                             if save_formats.get('md', False):
@@ -1083,6 +1101,12 @@ def run() -> None:
                                 json_bytes = to_json_bytes(recs)
                                 download_data.append((base_name, 'json', json_bytes))
                                 saved_counts['json'] += 1
+                            if save_formats.get('xlsx', False):
+                                recs = ensure_records({"raw_text": text})
+                                cols = all_columns(recs)
+                                xlsx_bytes = to_xlsx_bytes(recs, cols)
+                                download_data.append((base_name, 'xlsx', xlsx_bytes))
+                                saved_counts['xlsx'] += 1
                         
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
@@ -1124,6 +1148,11 @@ def run() -> None:
                                 (output_dir / f"{base_name}.docx").write_bytes(docx_bytes)
                                 saved_files['docx'] = str(output_dir / f"{base_name}.docx")
                                 saved_counts['docx'] += 1
+                            if save_formats.get('xlsx', False):
+                                xlsx_bytes = to_xlsx_bytes(recs, cols)
+                                (output_dir / f"{base_name}.xlsx").write_bytes(xlsx_bytes)
+                                saved_files['xlsx'] = str(output_dir / f"{base_name}.xlsx")
+                                saved_counts['xlsx'] += 1
                         else:
                             # UPLOAD MODE: Prepare for download
                             if save_formats.get('json', False):
@@ -1138,6 +1167,10 @@ def run() -> None:
                                 docx_bytes = to_docx_bytes(recs, cols)
                                 download_data.append((base_name, 'docx', docx_bytes))
                                 saved_counts['docx'] += 1
+                            if save_formats.get('xlsx', False):
+                                xlsx_bytes = to_xlsx_bytes(recs, cols)
+                                download_data.append((base_name, 'xlsx', xlsx_bytes))
+                                saved_counts['xlsx'] += 1
                         
                         if checkpoint is not None:
                             checkpoint.mark_processed(img_path, saved_files)
@@ -1178,6 +1211,8 @@ def run() -> None:
             saved_msgs.append(f"{saved_counts['md']} Markdown")
         if save_formats.get('docx', False):
             saved_msgs.append(f"{saved_counts['docx']} Word")
+        if save_formats.get('xlsx', False):
+            saved_msgs.append(f"{saved_counts['xlsx']} Excel")
 
         if is_folder_mode:
             # FOLDER MODE: Show save location
@@ -1205,11 +1240,14 @@ def run() -> None:
                     for idx, (fmt, data) in enumerate(formats):
                         with cols[idx]:
                             # Map format to extension and MIME type
-                            ext_map = {'json': ('.json', 'application/json'),
-                                     'md': ('.md', 'text/markdown'),
-                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext_map = {
+                                'json': ('.json', 'application/json'),
+                                'md': ('.md', 'text/markdown'),
+                                'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+                                'xlsx': ('.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+                            }
                             ext, mime = ext_map[fmt]
-                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word', 'xlsx': '📊 Excel'}
                             st.download_button(
                                 label_map[fmt],
                                 data=data,
@@ -1346,11 +1384,14 @@ def run() -> None:
                     cols = st.columns(len(formats))
                     for idx, (fmt, data) in enumerate(formats):
                         with cols[idx]:
-                            ext_map = {'json': ('.json', 'application/json'),
-                                     'md': ('.md', 'text/markdown'),
-                                     'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
+                            ext_map = {
+                                'json': ('.json', 'application/json'),
+                                'md': ('.md', 'text/markdown'),
+                                'docx': ('.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
+                                'xlsx': ('.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+                            }
                             ext, mime = ext_map[fmt]
-                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word'}
+                            label_map = {'json': '📄 JSON', 'md': '📝 Markdown', 'docx': '📘 Word', 'xlsx': '📊 Excel'}
                             st.download_button(
                                 label_map[fmt],
                                 data=data,
@@ -1411,6 +1452,15 @@ def run() -> None:
         
         with st.spinner(progress_text):
             gateway = gateway_from_descriptor(descriptor)
+            # Project-specific API key override
+            try:
+                active_project = storage.get_active_project()
+                if active_project:
+                    proj_key = storage.get_decrypted_project_api_key(active_project.id, descriptor.provider_id)
+                    if proj_key:
+                        gateway.auth_token = proj_key
+            except Exception:
+                pass
             if unstructured:
                 gateway.prefer_json_mode = False
                 gateway.prefer_tools = False

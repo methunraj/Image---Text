@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import hashlib
 import os
 import time
@@ -23,7 +24,7 @@ def _get_file_hash(path: str) -> str:
         stat = os.stat(path)
         # Use a separator that won't appear in file paths
         return f"{path}|||{stat.st_mtime}|||{stat.st_size}"
-    except:
+    except Exception:
         # Still use separator even on error for consistency
         return f"{path}|||0|||0"
 
@@ -305,7 +306,10 @@ class OAIGateway:
                 time.sleep(delay)
                 delay = min(delay * 2, 4.0)
 
-        assert last_exc is not None
+        if last_exc is None:
+            # Should not happen, but guard against optimized-out asserts
+            print(f"❌ All {retries} attempts failed with unknown error")
+            raise RuntimeError("All retry attempts failed with no captured exception")
         print(f"❌ All {retries} attempts failed")
         raise last_exc
 
@@ -376,7 +380,7 @@ class OAIGateway:
                     if isinstance(args, str):
                         try:
                             tool_call = json.loads(args)
-                        except:
+                        except Exception:
                             pass
                     elif isinstance(args, dict):
                         tool_call = args
@@ -751,13 +755,15 @@ class OAIGateway:
             # If we exhausted all variants, provide helpful error message
             if last_exc is not None:
                 if failed_with_none:
-                    raise httpx.HTTPError(f"API incompatible - rejected all {len(tried)} parameter variants and no-parameter request")
+                    raise RuntimeError(
+                        f"API incompatible - rejected all {len(tried)} parameter variants and no-parameter request"
+                    )
                 elif tried:
                     print(f"❌ None of {len(tried)} max_tokens parameters worked. Tried: {', '.join(tried[:5])}{'...' if len(tried) > 5 else ''}")
                 raise last_exc
             
             # This should never happen, but handle it gracefully
-            raise httpx.HTTPError("No request could be sent (no variants to try)")
+            raise RuntimeError("No request could be sent (no variants to try)")
 
         # Try EncA first
         enc_used = "EncA"

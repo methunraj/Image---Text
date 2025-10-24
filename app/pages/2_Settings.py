@@ -105,6 +105,34 @@ def _set_api_key_for_provider_code(provider_code: str, key_storage: str, new_key
     storage.set_provider_key(code, "encrypted" if enc else "session", enc)
     return ("encrypted" if enc else "session"), enc
 
+def _get_project_api_key(project_id: int, provider_code: str) -> Optional[str]:
+    """Resolve a project-scoped API key: session override first, then encrypted DB."""
+    proj_map: Dict[int, Dict[str, str]] = st.session_state.get("_project_api_keys", {})
+    code = (provider_code or "").strip().lower()
+    if project_id in proj_map and code in proj_map[project_id]:
+        return proj_map[project_id][code]
+    return storage.get_decrypted_project_api_key(project_id, code)
+
+def _set_project_api_key(project_id: int, provider_code: str, key_storage: str, new_key: str) -> tuple[str, Optional[str]]:
+    """Set project-scoped API key for provider_code.
+
+    Returns (storage_mode, enc_token)
+    """
+    code = (provider_code or "").strip().lower()
+    if not code:
+        return "session", None
+    if key_storage == "session":
+        proj_map: Dict[int, Dict[str, str]] = st.session_state.setdefault("_project_api_keys", {})
+        inner = proj_map.setdefault(project_id, {})
+        if new_key:
+            inner[code] = new_key
+        storage.set_project_key(project_id, code, "session", None)
+        return "session", None
+    kms = _get_kms()
+    enc = _encrypt(kms, new_key) if new_key else None
+    storage.set_project_key(project_id, code, "encrypted" if enc else "session", enc)
+    return ("encrypted" if enc else "session"), enc
+
 
 def _get_api_key_for_provider(pid: int, key_storage: str, enc: Optional[str]) -> Optional[str]:
     if key_storage == "session":
@@ -137,17 +165,31 @@ def _json_input(label: str, value: Any, key: str, height: int = 140) -> tuple[An
 
 def _ping_chat(base_url: str, api_key: str, model_id: str, headers: Dict[str, str] | None, timeout_s: float) -> Dict[str, Any]:
     """Send a minimal ping to test basic chat functionality."""
+    from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
     try:
         gateway = OAIGateway(
             base_url=base_url,
-            api_key=api_key,
-            headers=headers,
-            timeout=int(timeout_s),
+            timeouts=TimeoutConfig(connect_s=5.0, read_s=float(timeout_s), total_s=float(timeout_s)),
+            retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
             prefer_json_mode=False,
             prefer_tools=False,
-            detected_caps=None
+            default_temperature=1.0,
+            default_top_p=None,
+            max_output_tokens=256,
+            max_temperature=2.0,
+            headers=headers or {},
+            capabilities=None,
+            max_tokens_param_override=None,
+            cached_max_tokens_param=None,
+            allow_input_image_fallback=True,
+            provider_id="custom",
+            auth_mode=("bearer_token" if api_key else "none"),
+            auth_token=(api_key or None),
+            auth_header_name=None,
+            auth_query_param=None,
+            reasoning=ReasoningConfig()
         )
-        
+
         result = gateway.chat_vision(
             model=model_id,
             system_text="",
@@ -157,28 +199,42 @@ def _ping_chat(base_url: str, api_key: str, model_id: str, headers: Dict[str, st
             schema=None,
             gen_params={"temperature": 1.0, "max_tokens": 10}  # Small for test only
         )
-        
+
         if result.get("error"):
             return {"status": "error", "message": result["error"], "details": result}
         elif result.get("text"):
             return {"status": "success", "message": f"✓ Response: {result['text'][:100]}", "details": result}
         else:
             return {"status": "error", "message": "No text response received", "details": result}
-            
+
     except Exception as e:
         return {"status": "error", "message": f"Exception: {str(e)[:200]}", "details": None}
 
 
 def _capability_probe(base_url: str, api_key: str, model_id: str, headers: Dict[str, str] | None, timeout_s: float) -> Dict[str, Any]:
     """Comprehensive capability probing with encoding fallbacks."""
+    from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
     gateway = OAIGateway(
         base_url=base_url,
-        api_key=api_key, 
-        headers=headers,
-        timeout=int(timeout_s),
+        timeouts=TimeoutConfig(connect_s=5.0, read_s=float(timeout_s), total_s=float(timeout_s)),
+        retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
         prefer_json_mode=True,
         prefer_tools=False,
-        detected_caps=None  # Don't use caps during probing
+        default_temperature=1.0,
+        default_top_p=None,
+        max_output_tokens=256,
+        max_temperature=2.0,
+        headers=headers or {},
+        capabilities=None,
+        max_tokens_param_override=None,
+        cached_max_tokens_param=None,
+        allow_input_image_fallback=True,
+        provider_id="custom",
+        auth_mode=("bearer_token" if api_key else "none"),
+        auth_token=(api_key or None),
+        auth_header_name=None,
+        auth_query_param=None,
+        reasoning=ReasoningConfig()
     )
     
     results: Dict[str, Any] = {}
@@ -265,14 +321,28 @@ def _capability_probe(base_url: str, api_key: str, model_id: str, headers: Dict[
     
     # Tools probe
     try:
+        from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
         gateway_tools = OAIGateway(
             base_url=base_url,
-            api_key=api_key,
-            headers=headers, 
-            timeout=int(timeout_s),
+            timeouts=TimeoutConfig(connect_s=5.0, read_s=float(timeout_s), total_s=float(timeout_s)),
+            retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
             prefer_json_mode=False,
             prefer_tools=True,
-            detected_caps=None
+            default_temperature=1.0,
+            default_top_p=None,
+            max_output_tokens=256,
+            max_temperature=2.0,
+            headers=headers or {},
+            capabilities=None,
+            max_tokens_param_override=None,
+            cached_max_tokens_param=None,
+            allow_input_image_fallback=True,
+            provider_id="custom",
+            auth_mode=("bearer_token" if api_key else "none"),
+            auth_token=(api_key or None),
+            auth_header_name=None,
+            auth_query_param=None,
+            reasoning=ReasoningConfig(),
         )
         
         emit_schema = {
@@ -681,6 +751,60 @@ def _api_keys_manager(catalog: Dict[str, Any]) -> None:
             keys.pop(code, None)
             st.warning("Deleted")
 
+    st.markdown("---")
+    # Project-Scoped Keys management
+    active = storage.get_active_project()
+    st.markdown("#### 🔐 Project API Keys")
+    if not active:
+        st.info("Select an active project in the sidebar to manage project-specific keys.")
+        return
+    st.caption(f"Active Project: {active.name} (ID {active.id})")
+    # List existing project keys
+    pk_list = storage.list_project_keys(active.id)
+    if pk_list:
+        st.markdown("Configured:")
+        st.write(" ".join([f"`{rec.provider_code}`" for rec in pk_list]))
+    # Input row
+    pkA, pkB = st.columns([3, 2])
+    with pkA:
+        chosen = st.selectbox("Provider", options=["Choose a provider..."] + display, key="proj_key_provider_select")
+    with pkB:
+        code = ""
+        if chosen and chosen != "Choose a provider...":
+            idx = display.index(chosen)
+            code = options[idx][0]
+        prec = storage.get_project_key(active.id, code) if code else None
+        # Session-stored override
+        proj_map: Dict[int, Dict[str, str]] = st.session_state.get("_project_api_keys", {})
+        current_val = (proj_map.get(active.id, {}).get(code, None) if code else None) or (storage.get_decrypted_project_api_key(active.id, code) if code else None)
+        default_mode = (prec.key_storage if prec else ("encrypted" if _get_kms() else "session"))
+        mode = st.radio("Storage", options=["encrypted", "session"], index=(0 if default_mode == "encrypted" else 1), horizontal=True, key="proj_key_storage_mode")
+    # API key field
+    proj_api_val = st.text_input("API Key", value=(current_val or ""), type="password", key="proj_key_api_value", help="Leave blank to keep existing")
+    pc1, pc2, pc3 = st.columns([1, 1, 6])
+    with pc1:
+        if st.button("Save", disabled=not code):
+            new_val = proj_api_val or (current_val or "")
+            # Store project key
+            if mode == "session":
+                proj_map = st.session_state.setdefault("_project_api_keys", {})
+                inner = proj_map.setdefault(active.id, {})
+                inner[code] = new_val
+                storage.set_project_key(active.id, code, "session", None)
+            else:
+                kms = _get_kms()
+                enc = _encrypt(kms, new_val) if new_val else None
+                storage.set_project_key(active.id, code, "encrypted" if enc else "session", enc)
+            st.success("Saved project key")
+    with pc2:
+        if st.button("Delete", disabled=not prec):
+            storage.delete_project_key(active.id, code)
+            # Clear session cache
+            proj_map: Dict[int, Dict[str, str]] = st.session_state.get("_project_api_keys", {})
+            if active.id in proj_map:
+                proj_map[active.id].pop(code, None)
+            st.warning("Deleted")
+
 
 def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> None:
     """Streamlined configuration that sets an active model using provider keys."""
@@ -720,6 +844,44 @@ def _streamlined_model_configuration(selected_model_info: Dict[str, Any]) -> Non
                     badges.append(f"📏 {ctx:,} tokens")
                 if badges:
                     st.write(" · ".join(badges))
+            # Project-specific API Key override (expander)
+            active_project = storage.get_active_project()
+            with st.expander("Project API Key (Optional Override)", expanded=False):
+                if not active_project:
+                    st.info("No active project selected. Use the sidebar to choose a project.")
+                else:
+                    st.caption(f"Active Project: {active_project.name} (ID {active_project.id})")
+                    pkc1, pkc2 = st.columns([3, 2])
+                    with pkc1:
+                        project_key_val = st.text_input(
+                            "API Key",
+                            value=(_get_project_api_key(active_project.id, provider_id) or ""),
+                            type="password",
+                            key=f"proj_inline_{provider_id}"
+                        )
+                    with pkc2:
+                        rec = storage.get_project_key(active_project.id, provider_id) if provider_id else None
+                        default_mode = (rec.key_storage if rec else ("encrypted" if _get_kms() else "session"))
+                        proj_mode = st.radio(
+                            "Storage",
+                            options=["encrypted", "session"],
+                            index=(0 if default_mode == "encrypted" else 1),
+                            horizontal=True,
+                            key=f"proj_inline_mode_{provider_id}"
+                        )
+                    pkb1, pkb2, _ = st.columns([1, 1, 4])
+                    with pkb1:
+                        if st.button("Save Project Key", key=f"proj_inline_save_{provider_id}"):
+                            _set_project_api_key(active_project.id, provider_id, proj_mode, project_key_val or "")
+                            st.success("Saved project key")
+                    with pkb2:
+                        if st.button("Delete Project Key", key=f"proj_inline_del_{provider_id}"):
+                            storage.delete_project_key(active_project.id, provider_id)
+                            # Clear session cache
+                            proj_map: Dict[int, Dict[str, str]] = st.session_state.get("_project_api_keys", {})
+                            if active_project.id in proj_map:
+                                proj_map[active_project.id].pop(provider_id, None)
+                            st.warning("Deleted project key")
         with col_logo:
             if not is_custom:
                 logo_path = get_logo_path(provider_id)
@@ -1297,15 +1459,28 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
             storage.set_active_provider(temp_provider.id)
             # Quick parameter calibration to capture working max_tokens key for local endpoints
             try:
+                from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
                 gateway = OAIGateway(
                     base_url=base_url,
-                    api_key=(api_key or None) if not local_no_key else None,
-                    headers=headers_json if ok_headers else {},
-                    timeout=int(timeout_s),
+                    timeouts=TimeoutConfig(connect_s=5.0, read_s=float(timeout_s), total_s=float(timeout_s)),
+                    retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
                     prefer_json_mode=False,
                     prefer_tools=False,
-                    detected_caps=None,
-                    provider_id=temp_provider.id,
+                    default_temperature=1.0,
+                    default_top_p=None,
+                    max_output_tokens=256,
+                    max_temperature=2.0,
+                    headers=(headers_json if ok_headers else {}) or {},
+                    capabilities=None,
+                    max_tokens_param_override=None,
+                    cached_max_tokens_param=None,
+                    allow_input_image_fallback=True,
+                    provider_id=str(temp_provider.id),
+                    auth_mode=("bearer_token" if (api_key and not local_no_key) else "none"),
+                    auth_token=(api_key if (api_key and not local_no_key) else None),
+                    auth_header_name=None,
+                    auth_query_param=None,
+                    reasoning=ReasoningConfig(),
                 )
                 _ = gateway.chat_vision(
                     model=model_id,
@@ -1371,15 +1546,28 @@ def _model_configuration(selected_model_info: Dict[str, Any]) -> None:
                             )
                     # Quick parameter calibration to capture working max_tokens key for local endpoints
                     try:
+                        from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
                         gateway = OAIGateway(
                             base_url=base_url,
-                            api_key=(api_key or None) if not local_no_key else None,
-                            headers=headers_json if ok_headers else {},
-                            timeout=int(timeout_s),
+                            timeouts=TimeoutConfig(connect_s=5.0, read_s=float(timeout_s), total_s=float(timeout_s)),
+                            retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
                             prefer_json_mode=False,
                             prefer_tools=False,
-                            detected_caps=None,
-                            provider_id=p.id,
+                            default_temperature=1.0,
+                            default_top_p=None,
+                            max_output_tokens=256,
+                            max_temperature=2.0,
+                            headers=(headers_json if ok_headers else {}) or {},
+                            capabilities=None,
+                            max_tokens_param_override=None,
+                            cached_max_tokens_param=None,
+                            allow_input_image_fallback=True,
+                            provider_id=str(p.id),
+                            auth_mode=("bearer_token" if (api_key and not local_no_key) else "none"),
+                            auth_token=(api_key if (api_key and not local_no_key) else None),
+                            auth_header_name=None,
+                            auth_query_param=None,
+                            reasoning=ReasoningConfig(),
                         )
                         _ = gateway.chat_vision(
                             model=model_id,
@@ -1830,9 +2018,28 @@ def _pdf_tools() -> None:
                 
                 progress = st.progress(0.0, text="Converting PDFs...")
                 
+                MAX_PDF_SIZE = 50 * 1024 * 1024  # 50MB
                 for idx, f in enumerate(pdfs):
                     try:
                         tmp_path = tmp_root / _sanitize_filename(f.name)
+                        # Enforce size limits to avoid OOM
+                        try:
+                            size = getattr(f, "size", None)
+                            if size is None:
+                                # Seek to end to determine size if possible
+                                try:
+                                    f.seek(0, 2)
+                                    size = f.tell()
+                                    f.seek(0)
+                                except Exception:
+                                    size = None
+                            if size is not None and size > MAX_PDF_SIZE:
+                                st.error(f"{f.name}: File too large ({size/1024/1024:.1f}MB > 50MB)")
+                                continue
+                        except Exception:
+                            # If size detection fails, proceed but rely on downstream handling
+                            pass
+
                         tmp_path.write_bytes(f.read())
                         new, skipped, errs = convert_pdf_to_images(
                             tmp_path, out_dir,

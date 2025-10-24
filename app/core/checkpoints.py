@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -88,9 +89,18 @@ class FolderCheckpoint:
         tmp.write_text(text, encoding="utf-8")
         try:
             os.replace(tmp, self.path)
-        except Exception:
-            # best effort: fall back to direct write
-            self.path.write_text(text, encoding="utf-8")
+        except Exception as e:
+            # Fallback to direct write, but raise if that fails too
+            try:
+                self.path.write_text(text, encoding="utf-8")
+            except Exception as write_err:
+                # Ensure temporary file is removed before surfacing the error
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                finally:
+                    raise IOError(f"Failed to save checkpoint: {e}; fallback write failed: {write_err}")
+        finally:
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -125,15 +135,24 @@ class FolderCheckpoint:
             "avg_cost_per_image": 0.0
         })
         
-        stats["total_tokens_input"] = stats.get("total_tokens_input", 0) + tokens_in
-        stats["total_tokens_output"] = stats.get("total_tokens_output", 0) + tokens_out
+        MAX_TOKEN_COUNT = 2**53 - 1  # JavaScript safe integer max
+        cur_in = int(stats.get("total_tokens_input", 0) or 0)
+        cur_out = int(stats.get("total_tokens_output", 0) or 0)
+        if cur_in + int(tokens_in) > MAX_TOKEN_COUNT:
+            raise ValueError(f"Token count overflow: {cur_in} + {tokens_in} exceeds max")
+        if cur_out + int(tokens_out) > MAX_TOKEN_COUNT:
+            raise ValueError(f"Token count overflow: {cur_out} + {tokens_out} exceeds max")
+        stats["total_tokens_input"] = cur_in + int(tokens_in)
+        stats["total_tokens_output"] = cur_out + int(tokens_out)
         stats["total_cost_usd"] = stats.get("total_cost_usd", 0.0) + cost_usd
         stats["images_processed"] = stats.get("images_processed", 0) + 1
         stats["total_images"] = stats.get("images_processed", 0)
         
         # Update average
-        if stats["images_processed"] > 0:
+        if stats["images_processed"] > 0 and math.isfinite(stats.get("total_cost_usd", 0.0)):
             stats["avg_cost_per_image"] = stats["total_cost_usd"] / stats["images_processed"]
+        else:
+            stats["avg_cost_per_image"] = 0.0
         
         self.data["processing_stats"] = stats
     
@@ -261,4 +280,3 @@ class FolderCheckpoint:
                 to_delete.append(rel)
         for rel in to_delete:
             files.pop(rel, None)
-

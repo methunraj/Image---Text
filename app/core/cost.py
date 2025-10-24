@@ -9,9 +9,9 @@ def _unit_divisor(cost_block: Dict[str, Any]) -> float:
     Supports 'unit' of '1K tokens', '1M tokens', 'token', defaults to 1K.
     """
     unit = str(cost_block.get("unit", "1K tokens")).strip().lower()
-    if "1m" in unit:
+    if ("1m" in unit) or ("million" in unit):
         return 1_000_000.0
-    if "1k" in unit:
+    if ("1k" in unit) or ("thousand" in unit):
         return 1_000.0
     if "token" in unit:
         return 1.0
@@ -94,7 +94,14 @@ def cost_from_usage(usage: Optional[Dict[str, Any]], catalog_caps_json: Optional
         cache_read_usd = (cache_read / 1000.0) * cr_per_1k if cr_per_1k else 0.0
         cache_write_usd = (cache_write / 1000.0) * cw_per_1k if cw_per_1k else 0.0
 
-    total = input_usd + output_usd + cache_read_usd + cache_write_usd
+    # Use Decimal for accumulation to reduce floating point drift
+    from decimal import Decimal
+    total = float(
+        Decimal(str(input_usd))
+        + Decimal(str(output_usd))
+        + Decimal(str(cache_read_usd))
+        + Decimal(str(cache_write_usd))
+    )
     return {
         "input_usd": round(input_usd, 10),
         "output_usd": round(output_usd, 10),

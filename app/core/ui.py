@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 from pathlib import Path
 import streamlit as st
 from textwrap import dedent
@@ -28,9 +29,9 @@ def generate_provider_icon(provider_name: str, size: int = 24) -> str:
     Returns:
         Data URL containing the SVG icon
     """
-    # Generate consistent colors from provider name
-    hash_obj = hashlib.md5(provider_name.encode())
-    hash_hex = hash_obj.hexdigest()
+    # Generate consistent colors from provider name using SHA-256 (non-security usage)
+    hash_obj = hashlib.sha256(provider_name.encode())
+    hash_hex = hash_obj.hexdigest()[:32]
     
     # Extract RGB values from hash
     r = int(hash_hex[0:2], 16)
@@ -59,6 +60,7 @@ def generate_provider_icon(provider_name: str, size: int = 24) -> str:
         initials = (words[0][0] + words[1][0]).upper()
     else:
         initials = provider_name[:2].upper()
+    safe_initials = html.escape(initials)
     
     # Create SVG with gradient background and initials
     svg = f'''
@@ -73,7 +75,7 @@ def generate_provider_icon(provider_name: str, size: int = 24) -> str:
         <text x="50%" y="50%" text-anchor="middle" dy=".35em" 
               fill="white" font-family="Arial, sans-serif" 
               font-size="{int(size * 0.45)}" font-weight="600">
-            {initials}
+            {safe_initials}
         </text>
     </svg>
     '''
@@ -218,14 +220,28 @@ def generate_llm_provider_icon(provider_name: str, size: int = 24) -> str | None
                 return None
             
             # Create gateway
+            from app.core.config_schema import TimeoutConfig, RetryConfig, ReasoningConfig
             gateway = OAIGateway(
                 base_url=active_provider.base_url,
-                api_key=api_key or "",
-                headers=active_provider.headers_json or {},
-                timeout=30,  # Short timeout for icon generation
+                timeouts=TimeoutConfig(connect_s=5.0, read_s=30.0, total_s=30.0),
+                retry_config=RetryConfig(max_retries=1, backoff_s=0.5, retry_on=[429, 500, 502, 503, 504]),
                 prefer_json_mode=False,
                 prefer_tools=False,
-                detected_caps=None
+                default_temperature=0.7,
+                default_top_p=None,
+                max_output_tokens=512,
+                max_temperature=2.0,
+                headers=active_provider.headers_json or {},
+                capabilities=None,
+                max_tokens_param_override=None,
+                cached_max_tokens_param=None,
+                allow_input_image_fallback=True,
+                provider_id=str(active_provider.id),
+                auth_mode=("bearer_token" if api_key else "none"),
+                auth_token=(api_key or None),
+                auth_header_name=None,
+                auth_query_param=None,
+                reasoning=ReasoningConfig(),
             )
             
             # Generate prompt

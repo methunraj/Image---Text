@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +68,16 @@ class ProviderIcon(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     provider_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     svg_content: Mapped[str] = mapped_column(nullable=False)  # Full SVG markup
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+class ProjectKey(Base):
+    __tablename__ = "project_keys"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"))
+    # e.g., 'openai', 'openrouter', 'groq' — matches provider id/code used by registry
+    provider_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    key_storage: Mapped[str] = mapped_column(String(16), default="encrypted")  # 'session' | 'encrypted'
+    api_key_enc: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
 
 
@@ -275,6 +286,32 @@ def get_decrypted_api_key(provider_code: str) -> str | None:
     Session-stored secrets are handled in UI; this only returns persisted keys.
     """
     rec = get_provider_key(provider_code)
+    if not rec or rec.key_storage != "encrypted" or not rec.api_key_enc:
+        return None
+    try:
+        key = _get_kms_key()
+        if not key:
+            return None
+        from cryptography.fernet import Fernet  # type: ignore
+        return Fernet(key).decrypt(rec.api_key_enc.encode()).decode()
+    except Exception:
+        return None
+
+
+def get_decrypted_project_api_key(project_id: int, provider_code: str) -> str | None:
+    """Return decrypted API key for a specific project+provider_code if stored encrypted.
+
+    Session-scoped project keys are not persisted and thus not returned here.
+    """
+    if not provider_code:
+        return None
+    with get_db() as db:
+        rec: ProjectKey | None = (
+            db.query(ProjectKey)
+            .filter(ProjectKey.project_id == project_id)
+            .filter(ProjectKey.provider_code == provider_code.strip().lower())
+            .first()
+        )
     if not rec or rec.key_storage != "encrypted" or not rec.api_key_enc:
         return None
     try:
@@ -570,6 +607,71 @@ def delete_provider_key(provider_code: str) -> None:
             db.commit()
 
 
+# Project-scoped API keys (by project_id + provider_code)
+def list_project_keys(project_id: int) -> list[ProjectKey]:
+    with get_db() as db:
+        return (
+            db.query(ProjectKey)
+            .filter(ProjectKey.project_id == project_id)
+            .order_by(ProjectKey.provider_code.asc())
+            .all()
+        )
+
+
+def get_project_key(project_id: int, provider_code: str) -> ProjectKey | None:
+    if not provider_code:
+        return None
+    with get_db() as db:
+        return (
+            db.query(ProjectKey)
+            .filter(ProjectKey.project_id == project_id)
+            .filter(ProjectKey.provider_code == provider_code.strip().lower())
+            .first()
+        )
+
+
+def set_project_key(project_id: int, provider_code: str, key_storage: str, api_key_enc: str | None) -> ProjectKey:
+    """Create or update a project-scoped key record.
+
+    key_storage: 'session' or 'encrypted'. If 'session', api_key_enc is ignored and set to None.
+    """
+    code = provider_code.strip().lower()
+    storage_mode = key_storage if key_storage in ("session", "encrypted") else "encrypted"
+    enc = (api_key_enc if storage_mode == "encrypted" else None)
+    with get_db() as db:
+        rec = (
+            db.query(ProjectKey)
+            .filter(ProjectKey.project_id == project_id)
+            .filter(ProjectKey.provider_code == code)
+            .first()
+        )
+        if rec:
+            rec.key_storage = storage_mode
+            rec.api_key_enc = enc
+            db.add(rec)
+        else:
+            rec = ProjectKey(project_id=project_id, provider_code=code, key_storage=storage_mode, api_key_enc=enc)
+            db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
+
+
+def delete_project_key(project_id: int, provider_code: str) -> None:
+    if not provider_code:
+        return
+    with get_db() as db:
+        rec = (
+            db.query(ProjectKey)
+            .filter(ProjectKey.project_id == project_id)
+            .filter(ProjectKey.provider_code == provider_code.strip().lower())
+            .first()
+        )
+        if rec:
+            db.delete(rec)
+            db.commit()
+
+
 # --- Project Management ---
 def create_project(name: str, description: str | None = None) -> Project:
     """Create a new project."""
@@ -674,8 +776,11 @@ def get_project_stats(project_id: int) -> Dict[str, Any]:
     with get_db() as db:
         runs = db.query(Run).filter(Run.project_id == project_id).all()
         
-        total_images = sum(len(r.input_images_json or []) for r in runs)
-        total_cost_usd = sum(r.cost_usd or 0.0 for r in runs)
+        def _safe_len(value: Any) -> int:
+            return len(value) if isinstance(value, list) else 0
+
+        total_images = sum(_safe_len(r.input_images_json) for r in runs)
+        total_cost_usd = sum((r.cost_usd or 0.0) for r in runs)
         
         # Count unique models used
         models_used = set()
@@ -683,11 +788,17 @@ def get_project_stats(project_id: int) -> Dict[str, Any]:
             if r.provider and r.provider.model_id:
                 models_used.add(r.provider.model_id)
         
+        avg_cost = (
+            (total_cost_usd / total_images)
+            if total_images > 0 and math.isfinite(total_cost_usd)
+            else 0.0
+        )
+
         return {
             "total_runs": len(runs),
             "total_images": total_images,
             "total_cost_usd": total_cost_usd,
-            "avg_cost_per_image": (total_cost_usd / total_images if total_images > 0 else 0.0),
+            "avg_cost_per_image": avg_cost,
             "models_used": list(models_used),
         }
 
