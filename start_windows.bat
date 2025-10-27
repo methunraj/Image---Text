@@ -12,6 +12,9 @@ REM ======================================================================
 
 setlocal EnableExtensions EnableDelayedExpansion
 
+REM Initialize exit code to 0
+set "EXIT_CODE=0"
+
 REM Change to the directory of this script
 cd /d "%~dp0"
 
@@ -36,6 +39,7 @@ if %errorlevel%==0 (
 
 if not defined PYTHON_EXE (
   echo [ERROR] Python 3 is not installed or not on PATH. Please install Python 3 and retry.
+  set "EXIT_CODE=1"
   goto :hold
 )
 
@@ -50,6 +54,7 @@ if not exist ".venv\Scripts\python.exe" (
   %PYTHON_EXE% -m venv .venv
   if errorlevel 1 (
     echo [ERROR] Failed to create virtual environment.
+    set "EXIT_CODE=1"
     goto :hold
   )
 ) else (
@@ -61,11 +66,13 @@ REM Activate the virtual environment
 REM --------------------------------------------------
 if not exist ".venv\Scripts\activate.bat" (
   echo [ERROR] Could not find venv activation script at .venv\Scripts\activate.bat
+  set "EXIT_CODE=1"
   goto :hold
 )
 call ".venv\Scripts\activate.bat"
 if errorlevel 1 (
   echo [ERROR] Failed to activate the virtual environment.
+  set "EXIT_CODE=1"
   goto :hold
 )
 echo [INFO] Virtual environment activated.
@@ -74,6 +81,7 @@ REM Ensure pip is available from this venv
 python -m pip --version 1>nul 2>nul
 if errorlevel 1 (
   echo [ERROR] pip not found in the virtual environment.
+  set "EXIT_CODE=1"
   goto :hold
 )
 
@@ -86,6 +94,7 @@ if exist requirements.txt (
   python -m pip install -r requirements.txt
   if errorlevel 1 (
     echo [ERROR] Failed to install dependencies from requirements.txt
+    set "EXIT_CODE=1"
     goto :hold
   )
 ) else (
@@ -99,6 +108,7 @@ if errorlevel 1 (
   python -m pip install streamlit
   if errorlevel 1 (
     echo [ERROR] Failed to install Streamlit.
+    set "EXIT_CODE=1"
     goto :hold
   )
 )
@@ -130,6 +140,7 @@ if not defined APP_FILE (
 if not defined APP_FILE (
   echo [ERROR] Could not find an app entry point (missing app.py or app\main.py).
   echo         Set STREAMLIT_APP to your app path or create app.py.
+  set "EXIT_CODE=1"
   goto :hold
 )
 
