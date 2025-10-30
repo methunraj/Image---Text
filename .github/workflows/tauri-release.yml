@@ -1,0 +1,150 @@
+name: Tauri Release
+
+on:
+  # create a release by pushing a tag like v0.1.0
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # your repo coords (used to compose asset URLs)
+  REPO_OWNER: ${{ github.repository_owner }}
+  REPO_NAME:  ${{ github.event.repository.name }}
+  TAG_NAME:   ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]   # macOS arm64 & Windows x64; add macos-13 for Intel if you need both
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node (for Tauri bundler tooling)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Optional: cache cargo target to speed up
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Build + create (or update) a GitHub Release and upload artifacts
+      - name: Build with tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.TAG_NAME }}
+          releaseName: "ImageToText Desktop ${{ env.TAG_NAME }}"
+          releaseDraft: false
+          prerelease: false
+
+  publish-latest-json:
+    name: Publish latest.json
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build latest.json from release assets
+        id: buildjson
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = process.env.REPO_OWNER;
+            const repo  = process.env.REPO_NAME;
+            const tag   = process.env.TAG_NAME;
+
+            // Fetch release
+            const rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+
+            // List assets
+            const assets = await github.rest.repos.listReleaseAssets({
+              owner, repo, release_id: rel.data.id, per_page: 100
+            });
+
+            function find(re) { return assets.data.find(a => re.test(a.name)); }
+            async function signatureText(sigAsset) {
+              if (!sigAsset) return null;
+              const res = await github.request('GET /repos/{owner}/{repo}/releases/assets/{asset_id}', {
+                owner, repo, asset_id: sigAsset.id, headers: { accept: 'application/octet-stream' }
+              });
+              // res.data is Buffer
+              return Buffer.isBuffer(res.data) ? res.data.toString('utf8') : String(res.data);
+            }
+            function urlFor(asset) {
+              return `https://github.com/${owner}/${repo}/releases/download/${tag}/${asset.name}`;
+            }
+
+            // Try to resolve platform assets (adjust patterns if your filenames differ)
+            const winBin = find(/\.(msi|exe)$/i);
+            const winSig = winBin && (find(new RegExp('^' + winBin.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.sig$')) || find(/\.msi\.sig$|\.exe\.sig$/i));
+
+            // Prefer DMG for macOS; try to distinguish arm64 vs x64 by filename
+            const macDmgArm = find(/(arm64|aarch64).*\.dmg$/i);
+            const macDmgX64 = find(/(x64|x86_64).*\.dmg$/i);
+            const macDmgAny = find(/\.dmg$/i);
+
+            const macArm = macDmgArm || null;
+            const macX64 = macDmgX64 || (macDmgArm ? null : macDmgAny); // fallback: single-universal DMG treated as x64 key
+            const macArmSig = await signatureText(macArm && (find(new RegExp('^' + macArm.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.sig$')) || find(/\.dmg\.sig$/i)));
+            const macX64Sig = await signatureText(macX64 && (find(new RegExp('^' + macX64.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.sig$')) || find(/\.dmg\.sig$/i)));
+
+            const winSigText = await signatureText(winSig);
+
+            // Build updater JSON
+            const version = tag.startsWith('v') ? tag.slice(1) : tag;
+            const json = {
+              version,
+              notes: "",
+              pub_date: new Date().toISOString(),
+              platforms: {}
+            };
+
+            if (winBin && winSigText) {
+              json.platforms["windows-x86_64"] = {
+                signature: winSigText.trim(),
+                url: urlFor(winBin)
+              };
+            }
+            if (macArm && macArmSig) {
+              json.platforms["darwin-aarch64"] = {
+                signature: macArmSig.trim(),
+                url: urlFor(macArm)
+              };
+            }
+            if (macX64 && macX64Sig) {
+              json.platforms["darwin-x86_64"] = {
+                signature: macX64Sig.trim(),
+                url: urlFor(macX64)
+              };
+            }
+
+            const fs = require('fs');
+            fs.writeFileSync('latest.json', JSON.stringify(json, null, 2));
+            core.info('latest.json:\n' + JSON.stringify(json, null, 2));
+
+      - name: Upload latest.json to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ env.TAG_NAME }}
+        run: |
+          gh release upload "$TAG_NAME" latest.json --clobber

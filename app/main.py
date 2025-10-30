@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 import streamlit as st
+import time
+import traceback
 
 # Ensure project root on sys.path so `app` package imports work when running `streamlit run app/main.py`
 _ROOT = Path(__file__).resolve().parent.parent
@@ -18,7 +20,129 @@ from app.core import template_assets
 from app.core import ui as core_ui
 from app.core.model_registry import ModelRegistryError, active_model, ensure_registry
 from app.core.models_dev import get_logo_path
+from app.integrations.supabase_client import SupabaseMetaClient, SupabaseAPIError
+from app.auth.session import SessionManager, NotAuthenticated
+from app.sync.metadata_sync import MetadataSync
 
+def _redirect_to_login() -> None:
+    # Try to switch to the login page in multipage mode; fall back to rerun.
+    for candidate in ("app/pages/0_Login.py", "pages/0_Login.py", "0_Login.py"):
+        try:
+            st.switch_page(candidate)
+            return
+        except Exception:
+            continue
+    st.experimental_set_query_params(auth="login", t=str(time.time()))
+    st.rerun()
+
+
+def _load_or_redirect() -> tuple[SessionManager, MetadataSync]:
+    """
+    Ensure we have a valid Supabase session and a fresh local metadata cache.
+    This lets the rest of main.py run exactly as before.
+    """
+    # Build Supabase client (will raise if env missing)
+    try:
+        supa = SupabaseMetaClient()
+    except SupabaseAPIError as e:
+        st.error(f"Supabase not configured: {e}")
+        st.stop()
+
+    sm = SessionManager(supabase=supa)
+
+    # Try load persisted tokens (set by 0_Login or a previous run)
+    sess = sm.try_load_session_from_disk()
+    if not sess:
+        # If main.py is opened directly without login, redirect.
+        _redirect_to_login()
+        st.stop()
+
+    # Prepare local cache and sync if needed
+    db_path = os.getenv("APP_DB_PATH", "data/app.db")
+    sync = MetadataSync(db_path=db_path)
+    sync.ensure_schema()
+    info = sync.get_last_sync_info()
+    # Sync if cache is empty, belongs to another user, or is old (>10 min)
+    need_sync = (
+        not info.get("last_sync_user_id")
+        or info.get("last_sync_user_id") != sess.user.user_id
+        or _is_older_than_minutes(info.get("last_sync_ts"), 10)
+    )
+    if need_sync:
+        with st.spinner("Syncing configuration..."):
+            sm.sync_metadata_for_current_user(sync)
+
+    # Expose minimal session info to st.session_state for the rest of your app
+    sm.attach_to_streamlit_state()
+    return sm, sync
+
+
+def _is_older_than_minutes(ts_iso: str | None, minutes: int) -> bool:
+    if not ts_iso:
+        return True
+    try:
+        import datetime as _dt
+        last = _dt.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        return (_dt.datetime.now(_dt.timezone.utc) - last).total_seconds() > minutes * 60
+    except Exception:
+        return True
+
+
+def _sidebar_account_and_project(sm: SessionManager, sync: MetadataSync) -> None:
+    """
+    Safe, minimal sidebar: shows current user + project picker filtered to assignments.
+    If your main.py already renders a project dropdown, you can remove this block.
+    """
+    with st.sidebar:
+        # Account box
+        user = sm.current_user()
+        st.markdown(f"**{user.display_name or user.email}**")
+        st.caption(f"Role: `{user.role}`")
+
+        # Project select (assigned projects only)
+        projects = sync.list_projects_for_user()
+        if projects:
+            name_to_id = {p["name"]: p["id"] for p in projects}
+            # pick current
+            current_id = st.session_state.get("active_project_id", sm.get_active_project_id())
+            if current_id not in name_to_id.values():
+                current_id = next(iter(name_to_id.values()))
+                sm.set_active_project(current_id)
+
+            names = list(name_to_id.keys())
+            idx = list(name_to_id.values()).index(current_id) if current_id in name_to_id.values() else 0
+            chosen = st.selectbox("Project", names, index=idx, key="__auth_bootstrap_project_select")
+            new_id = name_to_id[chosen]
+            if new_id != current_id:
+                sm.set_active_project(new_id)
+
+        # Optional actions
+        col1, col2 = st.columns(2)
+        if col1.button("🔄 Resync", use_container_width=True):
+            with st.spinner("Refreshing configuration..."):
+                sm.sync_metadata_for_current_user(sync)
+                sm.attach_to_streamlit_state()
+            st.experimental_set_query_params(t=str(time.time()))
+            st.rerun()
+        if col2.button("🚪 Logout", use_container_width=True):
+            sm.logout()
+            _redirect_to_login()
+
+
+# ---- run the bootstrap unless explicitly disabled (for tests) ----
+if os.getenv("DISABLE_AUTH_BOOTSTRAP", "0").lower() not in ("1", "true", "yes", "y", "on"):
+    try:
+        __SM__, __SYNC__ = _load_or_redirect()
+        # Render a tiny sidebar section. If you already manage the sidebar elsewhere,
+        # you can delete this line and keep using st.session_state["active_project_id"].
+        _sidebar_account_and_project(__SM__, __SYNC__)
+    except NotAuthenticated:
+        _redirect_to_login()
+    except Exception as e:
+        st.error("Startup failed.")
+        with st.expander("Details"):
+            st.code(traceback.format_exc())
+        st.stop()
 
 def _get_active_profile() -> tuple[str, str | None, str | None]:
     """Resolve the active model/profile, logo, and provider_id from DB or env.
