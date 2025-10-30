@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
 import streamlit as st
-import io
 
 # Ensure project root on path when Streamlit runs page modules directly
 _ROOT = Path(__file__).resolve().parents[2]
@@ -29,10 +31,107 @@ from app.core.provider_openai import gateway_from_descriptor
 from app.core.templating import RenderedMessages, render_user_prompt
 from scripts.export_records import ensure_records, all_columns, to_json_bytes, to_markdown_bytes, to_xlsx_bytes
 from app.core.checkpoints import FolderCheckpoint
+from app.integrations.supabase_client import SupabaseMetaClient, SupabaseAPIError
+from app.auth.session import SessionManager
+from app.sync.metadata_sync import MetadataSync
 
 
 UPLOAD_DIR = Path("data/uploads")
 EXPORT_DIR = Path("export")
+
+# ================== AUTH & CACHE BOOTSTRAP (File 17) ==================
+
+def _redirect_to_login():
+    for cand in ("app/pages/0_Login.py", "pages/0_Login.py", "0_Login.py"):
+        try:
+            st.switch_page(cand)
+            return
+        except Exception:
+            continue
+    st.experimental_set_query_params(auth="login", t=str(time.time()))
+    st.rerun()
+
+@st.cache_resource(show_spinner=False)
+def _build_sync(db_path: str = None):
+    db_path = db_path or os.getenv("APP_DB_PATH", "data/app.db")
+    sync = MetadataSync(db_path=db_path)
+    sync.ensure_schema()
+    return sync
+
+def _ensure_session_and_cache():
+    try:
+        supa = SupabaseMetaClient()
+    except SupabaseAPIError as e:
+        st.error(f"Supabase not configured: {e}")
+        st.stop()
+
+    sm = SessionManager(supabase=supa)
+    sess = sm.try_load_session_from_disk()
+    if not sess:
+        _redirect_to_login()
+        st.stop()
+
+    # ensure cache exists (we don't force resync here; main.py already does periodic sync)
+    sync = _build_sync()
+    sm.attach_to_streamlit_state()  # expose role/email to the UI if needed
+
+    # adopt project chosen in sidebar (File 6)
+    pid = st.session_state.get("active_project_id")
+    if isinstance(pid, str):
+        sm.set_active_project(pid)
+
+    active_pid = sm.get_active_project_id()
+    if not active_pid:
+        st.warning("No project assigned. Please ask an admin to assign you to a project.")
+        st.stop()
+
+    # Make project keys available to downstream processing (plaintext kept in memory only)
+    st.session_state["__project_keys__"] = sm.get_decrypted_project_keys(sync, project_id=active_pid)
+
+    return sm, sync, active_pid
+
+__SM__, __SYNC__, __ACTIVE_PROJECT_ID__ = _ensure_session_and_cache()
+# ================= END AUTH & CACHE BOOTSTRAP (File 17) ================
+
+CURRENT_SYSTEM_PROMPT: str = ""
+CURRENT_USER_PROMPT: str = ""
+CURRENT_SCHEMA: Dict[str, Any] = {}
+
+
+def _track_usage_analytics(template_id: Optional[str]) -> None:
+    """Best-effort usage analytics hook; never breaks the flow."""
+    if "__active_template__" not in st.session_state:
+        return
+    if __SM__ is None or not hasattr(__SM__, "supa"):
+        return
+    try:
+        user = __SM__.current_user()
+        chosen_model_id = st.session_state.get("__chosen_model_id__")
+        template_state = st.session_state.get("__active_template__", {})
+        effective_template_id = template_id or template_state.get("id")
+        __SM__.supa.ensure_fresh_session()
+        __SM__.supa.insert_usage_analytics(
+            user_id=user.user_id,
+            project_id=__ACTIVE_PROJECT_ID__,
+            template_id=effective_template_id,
+            model_id=chosen_model_id,
+            meta={"page": "upload_and_process"},
+        )
+    except Exception:
+        # swallow analytics errors; they should never break the user flow
+        pass
+
+
+def _apply_project_api_key(gateway, provider_id: str) -> None:
+    """Inject project-scoped API key into the gateway when available."""
+    try:
+        project_keys = st.session_state.get("__project_keys__", {}) or {}
+        token = project_keys.get(provider_id)
+        if token:
+            gateway.auth_token = token
+    except Exception:
+        # Non-fatal: fall back to default credentials
+        pass
 
 
 @dataclass
@@ -740,8 +839,10 @@ def run() -> None:
     except ModelRegistryError:
         current_descriptor = registry.resolve(None)
         st.session_state["_selected_model_id"] = current_descriptor.id
+        st.session_state["__chosen_model_id__"] = current_descriptor.id
     else:
         st.session_state["_selected_model_id"] = current_descriptor.id
+        st.session_state["__chosen_model_id__"] = current_descriptor.id
 
     if registry.policies.allow_frontend_model_selection and len(selectable_models) > 1:
         options = sorted(
@@ -763,8 +864,10 @@ def run() -> None:
         if choice.id != current_descriptor.id:
             current_descriptor = choice
             st.session_state["_selected_model_id"] = choice.id
+            st.session_state["__chosen_model_id__"] = choice.id
     else:
         st.caption(f"Using model: {current_descriptor.provider_label} • {current_descriptor.label}")
+        st.session_state["__chosen_model_id__"] = current_descriptor.id
 
     # Load model context from registry
     try:
@@ -790,26 +893,59 @@ def run() -> None:
     # Template selection
     selected_template = None
     selected_template_name = None
+    global CURRENT_SYSTEM_PROMPT, CURRENT_USER_PROMPT, CURRENT_SCHEMA
     if not auto_json and not unstructured:
-        templates = storage.list_templates()
-        if not templates:
-            st.warning("⚠️ No templates configured")
-            if st.button("Create Template"):
-                st.switch_page("pages/2_Settings.py")
-            return
-        
-        template_names = [t.name for t in templates]
+        project_templates = __SYNC__.list_templates_for_project(__ACTIVE_PROJECT_ID__)
+
+        if not project_templates:
+            st.info(
+                "No templates are assigned to your current project. "
+                "Ask an admin to assign templates in Admin → Templates."
+            )
+            st.stop()
+
+        tpl_names = [tpl["name"] for tpl in project_templates]
+        if "selected_template_name" in st.session_state:
+            prev_selection = st.session_state.get("selected_template_name")
+            default_idx = next(
+                (idx for idx, name in enumerate(tpl_names) if name == prev_selection),
+                0,
+            )
+        else:
+            default_idx = 0
+
         selected_template_name = st.selectbox(
-            "Select Template",
-            options=template_names,
-            help="Choose a template to extract data from images"
+            "Template",
+            tpl_names,
+            index=default_idx,
+            key="selected_template_name",
+            help="Choose a template to extract data from images",
         )
-        
-        selected_template = next((t for t in templates if t.name == selected_template_name), None)
+        tpl = next(t for t in project_templates if t["name"] == selected_template_name)
+
+        CURRENT_SYSTEM_PROMPT = tpl.get("system_prompt", "") or ""
+        CURRENT_USER_PROMPT = tpl.get("user_prompt", "") or ""
+        CURRENT_SCHEMA = tpl.get("schema", {}) or {}
+
+        st.session_state["__active_template__"] = {
+            "id": tpl.get("id"),
+            "name": tpl.get("name"),
+            "system_prompt": CURRENT_SYSTEM_PROMPT,
+            "user_prompt": CURRENT_USER_PROMPT,
+            "schema": CURRENT_SCHEMA,
+        }
+
+        selected_template = SimpleNamespace(
+            id=tpl.get("id"),
+            name=tpl.get("name"),
+            description=tpl.get("description"),
+            system_prompt=CURRENT_SYSTEM_PROMPT,
+            user_prompt=CURRENT_USER_PROMPT,
+            schema_json=CURRENT_SCHEMA,
+        )
 
     # Synthetic template for Auto JSON / Unstructured
     if auto_json:
-        from types import SimpleNamespace
         selected_template_name = "Auto JSON"
         selected_template = SimpleNamespace(
             id=None,
@@ -826,8 +962,17 @@ def run() -> None:
             ),
             schema_json=None,
         )
+        CURRENT_SYSTEM_PROMPT = selected_template.system_prompt
+        CURRENT_USER_PROMPT = selected_template.user_prompt
+        CURRENT_SCHEMA = selected_template.schema_json or {}
+        st.session_state["__active_template__"] = {
+            "id": selected_template.id,
+            "name": selected_template.name,
+            "system_prompt": CURRENT_SYSTEM_PROMPT,
+            "user_prompt": CURRENT_USER_PROMPT,
+            "schema": CURRENT_SCHEMA,
+        }
     elif unstructured and selected_template is None:
-        from types import SimpleNamespace
         selected_template_name = "Unstructured"
         selected_template = SimpleNamespace(
             id=None,
@@ -836,6 +981,16 @@ def run() -> None:
             user_prompt="",
             schema_json=None,
         )
+        CURRENT_SYSTEM_PROMPT = selected_template.system_prompt
+        CURRENT_USER_PROMPT = selected_template.user_prompt
+        CURRENT_SCHEMA = selected_template.schema_json or {}
+        st.session_state["__active_template__"] = {
+            "id": selected_template.id,
+            "name": selected_template.name,
+            "system_prompt": CURRENT_SYSTEM_PROMPT,
+            "user_prompt": CURRENT_USER_PROMPT,
+            "schema": CURRENT_SCHEMA,
+        }
     
     if selected_template and not auto_json and not unstructured:
         # Show template info
@@ -1017,15 +1172,7 @@ def run() -> None:
         for idx, img_path in enumerate(selected, start=1):
             try:
                 per_file_gateway = gateway_from_descriptor(descriptor)
-                # Project-specific API key override
-                try:
-                    active_project = storage.get_active_project()
-                    if active_project:
-                        proj_key = storage.get_decrypted_project_api_key(active_project.id, descriptor.provider_id)
-                        if proj_key:
-                            per_file_gateway.auth_token = proj_key
-                except Exception:
-                    pass
+                _apply_project_api_key(per_file_gateway, descriptor.provider_id)
                 if unstructured:
                     per_file_gateway.prefer_json_mode = False
                     per_file_gateway.prefer_tools = False
@@ -1123,6 +1270,7 @@ def run() -> None:
                                 status="completed"
                             )
                             db_records_created += 1
+                            _track_usage_analytics(getattr(selected_template, "id", None))
                         except Exception as e:
                             # Silent but log to errors for debugging
                             errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
@@ -1187,6 +1335,7 @@ def run() -> None:
                                 status="completed"
                             )
                             db_records_created += 1
+                            _track_usage_analytics(getattr(selected_template, "id", None))
                         except Exception as e:
                             # Silent but log to errors for debugging
                             errors.append(f"DB recording failed for {Path(img_path).name}: {str(e)[:100]}")
@@ -1452,15 +1601,7 @@ def run() -> None:
         
         with st.spinner(progress_text):
             gateway = gateway_from_descriptor(descriptor)
-            # Project-specific API key override
-            try:
-                active_project = storage.get_active_project()
-                if active_project:
-                    proj_key = storage.get_decrypted_project_api_key(active_project.id, descriptor.provider_id)
-                    if proj_key:
-                        gateway.auth_token = proj_key
-            except Exception:
-                pass
+            _apply_project_api_key(gateway, descriptor.provider_id)
             if unstructured:
                 gateway.prefer_json_mode = False
                 gateway.prefer_tools = False
@@ -1814,6 +1955,7 @@ def run() -> None:
                         status="completed" if not result.get("error") else "error"
                     )
                     st.caption(f"Run saved with ID: {run.id}")
+                    _track_usage_analytics(getattr(selected_template, "id", None))
                 except Exception as e:
                     st.warning(f"Could not save run: {e}")
 
